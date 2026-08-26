@@ -1,0 +1,12 @@
+fastapi>=0.128,<0.142
+uvicorn[standard]>=0.48,<0.52
+pydantic>=2.13,<2.14
+pydantic-settings>=2.14,<2.16
+httpx>=0.28,<0.29
+dnspython>=2.8,<2.9
+typer>=0.26,<0.27
+rich>=14,<15
+pypdf>=6,<7
+cryptography>=45,<47
+mac-vendor-lookup>=0.1.15,<0.2
+zeroconf>=0.150,<0.151

@@ -1,0 +1,25 @@
+{
+  "name": "Authorized Example",
+  "targets": [
+    "example.com"
+  ],
+  "profile": "full",
+  "authorization_reference": "CHANGE-ME-TO-A-REAL-ENGAGEMENT-REFERENCE",
+  "scope": {
+    "allowed_domains": [
+      "example.com"
+    ],
+    "allowed_cidrs": [],
+    "excluded_domains": [],
+    "excluded_cidrs": [],
+    "max_requests_per_second": 10,
+    "max_concurrency": 32,
+    "allow_active_web": true,
+    "allow_load_testing": false,
+    "allow_udp_discovery": true,
+    "max_udp_hosts": 256,
+    "snmp_communities": [],
+    "allow_specialist_tools": false,
+    "specialist_tools": []
+  }
+}
