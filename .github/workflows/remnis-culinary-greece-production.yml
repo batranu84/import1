@@ -27,34 +27,50 @@ jobs:
 
           ITEM='https://www.searchculture.gr/aggregator/edm/amorgos_rep/000159-4399?language=en'
           s=requests.Session(); s.headers.update({'User-Agent':'Mozilla/5.0 REMNIS-Culinary/1.0'})
-          html=s.get(ITEM,timeout=60).text
-          Path('searchculture-item.html').write_text(html,encoding='utf-8')
-          soup=BeautifulSoup(html,'html.parser')
-          candidates=[]
-          for a in soup.find_all('a',href=True):
-              href=a['href']
-              text=' '.join(a.get_text(' ',strip=True).split()).casefold()
-              if '.pdf' in href.casefold() or 'digital file' in text or 'download' in text:
-                  candidates.append(requests.compat.urljoin(ITEM,href))
-          # Also inspect embedded JSON/metadata for direct PDF URLs.
-          for m in re.findall(r'https?[^\"\'<> ]+',html):
-              u=m.replace('&amp;','&')
-              if '.pdf' in u.casefold() and u not in candidates: candidates.append(u)
-          print('candidate URLs:', json.dumps(candidates,ensure_ascii=False,indent=2))
-          Path('greece-source-candidates.json').write_text(json.dumps(candidates,ensure_ascii=False,indent=2))
-          for url in candidates:
+          queue=[ITEM]
+          seen=set(); candidates=[]
+          while queue and len(seen)<20:
+              url=queue.pop(0)
+              if url in seen: continue
+              seen.add(url)
               try:
-                  r=s.get(url,timeout=90,allow_redirects=True)
-                  ct=r.headers.get('content-type','').casefold()
-                  if r.status_code==200 and (r.content[:4]==b'%PDF' or 'pdf' in ct) and len(r.content)>50000:
-                      Path('greece.pdf').write_bytes(r.content)
-                      Path('greece-source-url.txt').write_text(r.url)
-                      print('downloaded',r.url,len(r.content))
-                      break
+                  r=s.get(url,timeout=60,allow_redirects=True)
               except Exception as e:
-                  print('candidate failed',url,e)
+                  print('request failed',url,e); continue
+              ct=r.headers.get('content-type','').casefold()
+              print('inspect',r.status_code,ct,r.url,len(r.content))
+              if r.status_code==200 and (r.content[:4]==b'%PDF' or 'application/pdf' in ct) and len(r.content)>50000:
+                  Path('greece.pdf').write_bytes(r.content)
+                  Path('greece-source-url.txt').write_text(r.url)
+                  print('downloaded PDF',r.url,len(r.content)); break
+              text=r.text if ('text' in ct or 'json' in ct or r.content[:1] in (b'{',b'[')) else ''
+              if not text: continue
+              if url==ITEM: Path('searchculture-item.html').write_text(text,encoding='utf-8')
+              # SearchCulture exposes the repository metadata endpoint as jsonitems/4399.
+              urls=[]
+              try:
+                  obj=r.json()
+                  def walk(x):
+                      if isinstance(x,dict):
+                          for v in x.values(): walk(v)
+                      elif isinstance(x,list):
+                          for v in x: walk(v)
+                      elif isinstance(x,str) and x.startswith(('http://','https://')): urls.append(x)
+                  walk(obj)
+              except Exception:
+                  soup=BeautifulSoup(text,'html.parser')
+                  urls += [requests.compat.urljoin(r.url,a['href']) for a in soup.find_all('a',href=True)]
+                  urls += [x.replace('&amp;','&') for x in re.findall(r'https?[^\"\'<> ]+',text)]
+              for u in urls:
+                  lu=u.casefold()
+                  if u not in seen and u not in queue and (
+                      '.pdf' in lu or 'download' in lu or 'bitstream' in lu or 'file' in lu or
+                      'jsonitems' in lu or 'repository.gr' in lu
+                  ):
+                      candidates.append(u); queue.append(u)
+          Path('greece-source-candidates.json').write_text(json.dumps(candidates,ensure_ascii=False,indent=2))
           if not Path('greece.pdf').exists():
-              raise SystemExit('Could not resolve the SearchCulture PDF download URL')
+              raise SystemExit('Could not resolve repository PDF after following SearchCulture jsonitems metadata')
 
       - name: Extract and build Greece pack
         run: |
@@ -64,9 +80,7 @@ jobs:
           import hashlib,json,re,unicodedata,uuid
           from pathlib import Path
           MINIMUM=300; TARGET=350
-          text=Path('greece.txt').read_text(encoding='utf-8',errors='ignore')
-          # Normalize historic Greek while preserving content.
-          text=text.replace('\u00ad','')
+          text=Path('greece.txt').read_text(encoding='utf-8',errors='ignore').replace('\u00ad','')
           lines=[re.sub(r'\s+',' ',x).strip() for x in text.splitlines()]
           heading_re=re.compile(r'^(?:[Α-ΩϚϛ͵0-9]+[.)΄´-]?\s*)?([Ά-ώἀ-῾A-Za-z][^.!?]{2,90})$')
           cook_re=re.compile(r'(βράζ|βραζ|ψήν|ψην|τηγαν|κόπτ|κοπτ|κόβ|κοβ|ανακατεύ|ρίπτ|ριπτ|βάζ|βαζ|προσθέτ|προσθετ|σερβίρ|σερβιρ|ζύμ|ζυμ|σάλτσ|σαλτσ|κρέας|κρεας|ψάρι|ψαρι|όρνιθ|ορνιθ|αυγ|ωό|γάλα|γαλα|βούτυρ|βουτυρ|έλαι|ελαι|λάδι|λαδι|άλευρ|αλευρ|ρύζ|ρυζ|ζάχαρ|ζαχαρ|άλας|αλατ|πιπέρι|πιπερι|κρεμμύ|κρεμμυ|σκόρδ|σκορδ)')
@@ -80,7 +94,6 @@ jobs:
           for i,line in enumerate(lines):
               if not line or len(line)>100: continue
               if heading_re.match(line) and not cook_re.search(line.casefold()):
-                  # Historical recipe titles are short standalone lines; require nearby cooking prose.
                   nearby=' '.join(lines[i+1:i+7]).casefold()
                   if cook_re.search(nearby): starts.append(i)
           starts=sorted(set(starts)); starts.append(len(lines))
@@ -93,7 +106,6 @@ jobs:
               low=canon(body); ingredients=[]
               for t in ingredient_terms:
                   if canon(t) in low: ingredients.append(t)
-              # Some historical recipes don't enumerate ingredients separately; require 2 identifiable food ingredients.
               if len(set(map(canon,ingredients)))<2: rejected['incomplete']+=1; continue
               tk=canon(title); cf=hashlib.sha1(canon(body).encode()).hexdigest()
               if not tk or tk in seen_t or cf in seen_c: rejected['duplicate']+=1; continue
