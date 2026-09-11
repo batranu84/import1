@@ -1,0 +1,3 @@
+Trigger isolated REMNIS Culinary production acquisition runner.
+Target cuisines: ro, gr, cn, jp.
+Hard gate: >=300 complete, distinct, source-grounded recipes per cuisine.
