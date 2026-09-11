@@ -1,0 +1,138 @@
+name: REMNIS Culinary China Production
+
+on:
+  push:
+    branches: [remnis-culinary-builder]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-china:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Acquire source repositories
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/Anduin2017/HowToCook.git howtocook
+          curl --fail --location --retry 4 --retry-delay 2 \
+            https://raw.githubusercontent.com/AdamBouhmad/open-recipe-archive/main/collections/chinese-kitchen/recipes.jsonl \
+            -o chinese-kitchen.jsonl
+
+      - name: Build validated China pack
+        shell: python
+        run: |
+          import hashlib, json, re, unicodedata, uuid
+          from pathlib import Path
+
+          MINIMUM=300
+          TARGET=350
+          recipes=[]
+          seen_titles=set(); seen_content=set()
+          rejected={'incomplete':0,'duplicate':0,'source_parse':0,'cross_reference':0}
+
+          def canonical(v):
+              v=unicodedata.normalize('NFKD',str(v))
+              v=''.join(ch for ch in v if not unicodedata.combining(ch))
+              return re.sub(r'\s+',' ',re.sub(r'[^\w\u3400-\u9fff]+',' ',v.casefold())).strip()
+
+          def fingerprint(ings,steps):
+              return hashlib.sha1('|'.join(canonical(x) for x in ings+steps).encode()).hexdigest()
+
+          def add(title, ingredients, steps, provenance):
+              title=title.strip()
+              ingredients=[x.strip(' -*\t') for x in ingredients if x.strip(' -*\t')]
+              steps=[x.strip() for x in steps if x.strip()]
+              if not title or len(ingredients)<2 or len(steps)<1:
+                  rejected['incomplete']+=1; return
+              joined=' '.join(ingredients+steps)
+              if re.search(r'\b(?:see|refer to|recipe)\s+(?:no\.?|number)?\s*\d+\b',joined,re.I):
+                  rejected['cross_reference']+=1; return
+              key=canonical(title); fp=fingerprint(ingredients,steps)
+              if key in seen_titles or fp in seen_content:
+                  rejected['duplicate']+=1; return
+              seen_titles.add(key); seen_content.add(fp)
+              slug=re.sub(r'[^a-z0-9]+','-',unicodedata.normalize('NFKD',title).encode('ascii','ignore').decode().casefold()).strip('-')[:50]
+              if not slug: slug='cn-'+hashlib.sha1(title.encode()).hexdigest()[:12]
+              rid='cn-'+slug+'-'+hashlib.sha1((title+str(provenance)).encode()).hexdigest()[:8]
+              recipes.append({
+                'id':rid,'countryID':'cn','name':title,'mealType':'main',
+                'description':'Source-grounded Chinese recipe.','baseServings':0,'prepMinutes':0,'cookMinutes':0,
+                'ingredients':[{'id':str(uuid.uuid5(uuid.NAMESPACE_URL,'remnis-cn-ing:'+x)),'name':x,'amount':0.0,'unit':'','note':None} for x in ingredients],
+                'steps':steps,'tags':['cn','source-grounded'],
+                'provenance':provenance
+              })
+
+          # Historical Chinese source first.
+          with open('chinese-kitchen.jsonl',encoding='utf-8') as f:
+              for line in f:
+                  if not line.strip(): continue
+                  try: obj=json.loads(line)
+                  except Exception: rejected['source_parse']+=1; continue
+                  body=str(obj.get('body','')); mode=None; ing=[]; steps=[]
+                  for raw in body.splitlines():
+                      line=raw.strip()
+                      if not line: continue
+                      low=line.casefold().strip('#: ')
+                      if low.startswith(('ingredient','materials')): mode='ing'; continue
+                      if low.startswith(('direction','instruction','method','preparation','procedure')): mode='steps'; continue
+                      if line.startswith('#'): continue
+                      text=re.sub(r'^[-*]\s*','',line)
+                      text=re.sub(r'^\d+[.)]\s*','',text)
+                      if mode=='ing': ing.append(text)
+                      elif mode=='steps': steps.append(text)
+                  add(str(obj.get('title','')),ing,steps,{
+                    'collection':obj.get('collection'),'culture':'china','sourceTitle':obj.get('source_title'),
+                    'sourceURL':obj.get('source_url'),'sourceYear':obj.get('source_year'),'license':obj.get('license')
+                  })
+
+          # Modern Chinese source from HowToCook, released under The Unlicense.
+          for p in sorted(Path('howtocook/dishes').rglob('*.md')):
+              text=p.read_text(encoding='utf-8',errors='ignore')
+              title=''
+              m=re.search(r'^#\s+(.+?)\s*$',text,re.M)
+              if m: title=m.group(1).strip()
+              if not title: title=p.stem
+              lines=text.splitlines(); section=None; ing=[]; steps=[]
+              for raw in lines:
+                  s=raw.strip()
+                  if re.match(r'^##+\s+',s):
+                      h=re.sub(r'^##+\s+','',s).strip()
+                      if any(k in h for k in ['原料','材料','配料','准备']): section='ing'
+                      elif any(k in h for k in ['操作','步骤','制作','做法']): section='steps'
+                      else: section=None
+                      continue
+                  if section=='ing' and re.match(r'^[-*+]\s+',s):
+                      ing.append(re.sub(r'^[-*+]\s+','',s))
+                  elif section=='steps':
+                      if re.match(r'^(?:\d+[.)、]|[-*+])\s*',s):
+                          steps.append(re.sub(r'^(?:\d+[.)、]|[-*+])\s*','',s))
+                      elif s and not s.startswith('#') and len(s)>8:
+                          steps.append(s)
+              add(title,ing,steps,{
+                'collection':'Anduin2017/HowToCook','culture':'china','sourceTitle':p.stem,
+                'sourceURL':'https://github.com/Anduin2017/HowToCook/blob/master/'+str(p.relative_to('howtocook')).replace(' ','%20'),
+                'sourceYear':None,'license':'unlicense'
+              })
+
+          selected=recipes[:TARGET]
+          status='PASS' if len(selected)>=MINIMUM else 'FAIL'
+          Path('out').mkdir()
+          pack=Path('out/CulinaryRecipes-cn.json')
+          pack.write_text(json.dumps({'schemaVersion':1,'countryID':'cn','recipes':selected},ensure_ascii=False,separators=(',',':')),encoding='utf-8')
+          sha=hashlib.sha256(pack.read_bytes()).hexdigest()
+          report={'countryID':'cn','uniqueStandaloneRows':len(recipes),'shippedRows':len(selected),'minimumRequired':MINIMUM,'status':status,'sha256':sha,'rejected':rejected}
+          Path('out/cn-production-report.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
+          Path('out/CulinaryRecipes-cn.json.sha256').write_text(sha+'  CulinaryRecipes-cn.json\n')
+          print(json.dumps(report,ensure_ascii=False,indent=2))
+          if status!='PASS': raise SystemExit('China pack failed 300+ gate')
+
+      - name: Upload China production artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: remnis-culinary-china
+          path: out/
+          if-no-files-found: error
+          compression-level: 9
