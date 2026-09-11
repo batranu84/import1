@@ -14,110 +14,188 @@ jobs:
     steps:
       - name: Install extraction tools
         run: |
+          set -euo pipefail
           sudo apt-get update -qq
-          sudo apt-get install -y -qq poppler-utils
-          python -m pip install --quiet requests beautifulsoup4
+          sudo apt-get install -y -qq poppler-utils tesseract-ocr tesseract-ocr-ell
+          python -m pip install --quiet requests beautifulsoup4 pypdf
 
-      - name: Acquire public-domain Greek cookbook
+      - name: Acquire complete public-domain Greek cookbook
         shell: python
         run: |
-          import json, re, requests
+          import json, re, time, requests
           from bs4 import BeautifulSoup
           from pathlib import Path
+          from urllib.parse import urljoin, urlparse
 
           ITEM='https://www.searchculture.gr/aggregator/edm/amorgos_rep/000159-4399?language=en'
-          s=requests.Session(); s.headers.update({'User-Agent':'Mozilla/5.0 REMNIS-Culinary/1.0'})
-          queue=[ITEM]
-          seen=set(); candidates=[]
-          while queue and len(seen)<20:
-              url=queue.pop(0)
-              if url in seen: continue
-              seen.add(url)
-              try:
-                  r=s.get(url,timeout=60,allow_redirects=True)
-              except Exception as e:
-                  print('request failed',url,e); continue
-              ct=r.headers.get('content-type','').casefold()
-              print('inspect',r.status_code,ct,r.url,len(r.content))
-              if r.status_code==200 and (r.content[:4]==b'%PDF' or 'application/pdf' in ct) and len(r.content)>50000:
-                  Path('greece.pdf').write_bytes(r.content)
-                  Path('greece-source-url.txt').write_text(r.url)
-                  print('downloaded PDF',r.url,len(r.content)); break
-              text=r.text if ('text' in ct or 'json' in ct or r.content[:1] in (b'{',b'[')) else ''
-              if not text: continue
-              if url==ITEM: Path('searchculture-item.html').write_text(text,encoding='utf-8')
-              # SearchCulture exposes the repository metadata endpoint as jsonitems/4399.
-              urls=[]
-              try:
-                  obj=r.json()
-                  def walk(x):
-                      if isinstance(x,dict):
-                          for v in x.values(): walk(v)
-                      elif isinstance(x,list):
-                          for v in x: walk(v)
-                      elif isinstance(x,str) and x.startswith(('http://','https://')): urls.append(x)
-                  walk(obj)
-              except Exception:
-                  soup=BeautifulSoup(text,'html.parser')
-                  urls += [requests.compat.urljoin(r.url,a['href']) for a in soup.find_all('a',href=True)]
-                  urls += [x.replace('&amp;','&') for x in re.findall(r'https?[^\"\'<> ]+',text)]
-              for u in urls:
-                  lu=u.casefold()
-                  if u not in seen and u not in queue and (
-                      '.pdf' in lu or 'download' in lu or 'bitstream' in lu or 'file' in lu or
-                      'jsonitems' in lu or 'repository.gr' in lu
-                  ):
-                      candidates.append(u); queue.append(u)
-          Path('greece-source-candidates.json').write_text(json.dumps(candidates,ensure_ascii=False,indent=2))
-          if not Path('greece.pdf').exists():
-              raise SystemExit('Could not resolve repository PDF after following SearchCulture jsonitems metadata')
+          ROOT='https://amorgoslib.repository.gr/'
+          SETS=[
+            ROOT+'index.php?lang=gr&com=jsonitems&set=3821',
+            ROOT+'index.php?lang=gr&com=jsonitems&set=3822',
+            ROOT+'jsonitems/index.php?lang=gr&com=jsonitems&set=3821',
+            ROOT+'jsonitems/index.php?lang=gr&com=jsonitems&set=3822',
+          ]
+          DIRECT_TITLE='https://amorgoslib-admin.repository.gr/files/original/8bbbf53ee6085917c802cf92e55c588a5988ad00.pdf'
+          s=requests.Session(); s.headers.update({'User-Agent':'Mozilla/5.0 REMNIS-Culinary/1.1'})
+          Path('greek-pages').mkdir()
+          evidence=[]; page_urls=[]; item_urls=[]; pdf_urls=[]
 
-      - name: Extract and build Greece pack
+          def get(url, timeout=45):
+            try:
+              r=s.get(url,timeout=timeout,allow_redirects=True)
+              evidence.append({'url':url,'finalURL':r.url,'status':r.status_code,'contentType':r.headers.get('content-type',''),'bytes':len(r.content)})
+              return r
+            except Exception as e:
+              evidence.append({'url':url,'status':'ERROR','error':str(e)})
+              return None
+
+          # Establish provenance from the SearchCulture record and capture every repository/set link.
+          r=get(ITEM)
+          if r is None or r.status_code != 200:
+            raise SystemExit('SearchCulture provenance record unavailable')
+          Path('searchculture-item.html').write_text(r.text,encoding='utf-8')
+          provenance_text=BeautifulSoup(r.text,'html.parser').get_text(' ',strip=True).casefold()
+          if not ('εγχειρίδιον' in provenance_text or 'mageirik' in provenance_text or 'πλατύ' in provenance_text or 'platys' in provenance_text):
+            raise SystemExit('SearchCulture record does not match target cookbook')
+
+          seed_urls=list(SETS)
+          soup=BeautifulSoup(r.text,'html.parser')
+          for a in soup.find_all('a',href=True):
+            u=urljoin(r.url,a['href'])
+            if 'repository.gr' in urlparse(u).netloc and u not in seed_urls:
+              seed_urls.append(u)
+
+          # Crawl collection/set pages. The old workflow stopped on the first PDF, which is only the title page.
+          seen=set(); queue=seed_urls[:]
+          while queue and len(seen)<350:
+            u=queue.pop(0)
+            if u in seen: continue
+            seen.add(u)
+            rr=get(u)
+            if rr is None or rr.status_code not in (200,404): continue
+            ct=rr.headers.get('content-type','').casefold()
+            if rr.content[:4] == b'%PDF' or 'application/pdf' in ct:
+              if len(rr.content)>20000:
+                if rr.url not in pdf_urls: pdf_urls.append(rr.url)
+              continue
+            if 'html' not in ct and 'text' not in ct: continue
+            hs=BeautifulSoup(rr.text,'html.parser')
+            txt=hs.get_text(' ',strip=True).casefold()
+            # Save large collection pages for evidence/debugging.
+            if 'set=3821' in u or 'set=3822' in u:
+              Path('set-'+('3821' if '3821' in u else '3822')+'.html').write_text(rr.text,encoding='utf-8')
+            for a in hs.find_all('a',href=True):
+              v=urljoin(rr.url,a['href'])
+              lv=v.casefold(); host=urlparse(v).netloc.casefold()
+              if 'repository.gr' not in host: continue
+              if '/files/original/' in lv and ('.pdf' in lv or 'file' in lv):
+                if v not in pdf_urls: pdf_urls.append(v)
+              elif ('com=jsonitems' in lv or '/jsonitems/' in lv or 'item' in lv) and v not in seen and v not in queue:
+                item_urls.append(v)
+                # Crawl sibling item pages; cap prevents wandering the entire repository.
+                if len(queue)<250: queue.append(v)
+
+          # Direct title-page PDF is useful only for provenance; never count it as the whole book.
+          if DIRECT_TITLE not in pdf_urls: pdf_urls.append(DIRECT_TITLE)
+
+          # Probe candidate PDFs and keep all distinct original files discovered from the target collection pages.
+          downloaded=[]; hashes=set()
+          import hashlib
+          for idx,u in enumerate(pdf_urls[:260]):
+            rr=get(u,60)
+            if rr is None or rr.status_code!=200 or not (rr.content[:4]==b'%PDF' or 'application/pdf' in rr.headers.get('content-type','').casefold()):
+              continue
+            if len(rr.content)<20000: continue
+            h=hashlib.sha256(rr.content).hexdigest()
+            if h in hashes: continue
+            hashes.add(h)
+            p=Path('greek-pages')/f'{len(downloaded):04d}.pdf'
+            p.write_bytes(rr.content)
+            downloaded.append({'path':str(p),'url':rr.url,'bytes':len(rr.content),'sha256':h})
+
+          Path('greece-source-candidates.json').write_text(json.dumps({'seedURLs':seed_urls,'itemURLs':item_urls,'pdfURLs':pdf_urls,'downloaded':downloaded,'requests':evidence},ensure_ascii=False,indent=2),encoding='utf-8')
+          print('repository pages crawled:',len(seen))
+          print('candidate item URLs:',len(set(item_urls)))
+          print('candidate PDF URLs:',len(pdf_urls))
+          print('distinct PDFs downloaded:',len(downloaded))
+          if len(downloaded)<2:
+            raise SystemExit('Full cookbook sibling pages were not resolved; only title-page material found')
+
+      - name: Extract full corpus and build Greece pack
         run: |
           set -euo pipefail
-          pdftotext -layout greece.pdf greece.txt
+          mkdir -p greek-text out
+          : > greece-full.txt
+          for f in greek-pages/*.pdf; do
+            base="$(basename "$f" .pdf)"
+            pdftotext -layout "$f" "greek-text/$base.txt" || true
+            chars=$(wc -m < "greek-text/$base.txt" 2>/dev/null || echo 0)
+            greek=$(grep -oE '[Α-Ωα-ωΆ-ώ]' "greek-text/$base.txt" 2>/dev/null | wc -l || true)
+            if [ "$chars" -lt 150 ] || [ "$greek" -lt 30 ]; then
+              mkdir -p "greek-text/ocr-$base"
+              pdftoppm -jpeg -r 220 "$f" "greek-text/ocr-$base/page" >/dev/null 2>&1 || true
+              : > "greek-text/$base.ocr.txt"
+              for img in greek-text/ocr-$base/page-*.jpg; do
+                [ -e "$img" ] || continue
+                tesseract "$img" stdout -l ell --psm 6 2>/dev/null >> "greek-text/$base.ocr.txt" || true
+                printf '\n' >> "greek-text/$base.ocr.txt"
+              done
+              if [ -s "greek-text/$base.ocr.txt" ]; then mv "greek-text/$base.ocr.txt" "greek-text/$base.txt"; fi
+            fi
+            cat "greek-text/$base.txt" >> greece-full.txt
+            printf '\n\f\n' >> greece-full.txt
+          done
           python - <<'PY'
           import hashlib,json,re,unicodedata,uuid
           from pathlib import Path
           MINIMUM=300; TARGET=350
-          text=Path('greece.txt').read_text(encoding='utf-8',errors='ignore').replace('\u00ad','')
+          raw=Path('greece-full.txt').read_text(encoding='utf-8',errors='ignore').replace('\u00ad','')
+          text=unicodedata.normalize('NFC',raw)
           lines=[re.sub(r'\s+',' ',x).strip() for x in text.splitlines()]
-          heading_re=re.compile(r'^(?:[Α-ΩϚϛ͵0-9]+[.)΄´-]?\s*)?([Ά-ώἀ-῾A-Za-z][^.!?]{2,90})$')
-          cook_re=re.compile(r'(βράζ|βραζ|ψήν|ψην|τηγαν|κόπτ|κοπτ|κόβ|κοβ|ανακατεύ|ρίπτ|ριπτ|βάζ|βαζ|προσθέτ|προσθετ|σερβίρ|σερβιρ|ζύμ|ζυμ|σάλτσ|σαλτσ|κρέας|κρεας|ψάρι|ψαρι|όρνιθ|ορνιθ|αυγ|ωό|γάλα|γαλα|βούτυρ|βουτυρ|έλαι|ελαι|λάδι|λαδι|άλευρ|αλευρ|ρύζ|ρυζ|ζάχαρ|ζαχαρ|άλας|αλατ|πιπέρι|πιπερι|κρεμμύ|κρεμμυ|σκόρδ|σκορδ)')
-          ingredient_terms=['κρέας','ψάρι','όρνιθα','αυγά','γάλα','βούτυρο','έλαιον','λάδι','άλευρον','ρύζι','ζάχαρη','άλας','αλάτι','πιπέρι','κρεμμύδι','σκόρδο','λεμόνι','ξύδι','οίνος','κρασί','τυρί','πατάτες','φασόλια','αρακάς','ντομάτα','μαϊντανός','κανέλα','αμύγδαλα','σταφίδες']
+
           def canon(v):
               v=unicodedata.normalize('NFKD',str(v)).casefold()
               v=''.join(c for c in v if not unicodedata.combining(c))
               return re.sub(r'[^a-zα-ω0-9]+',' ',v).strip()
-          recipes=[]; seen_t=set(); seen_c=set(); rejected={'short':0,'non_recipe':0,'duplicate':0,'incomplete':0,'cross_reference':0}
+
+          cook_terms=('βραζ','ψη','τηγαν','κοπτ','κοβ','ανακατευ','ριπτ','βαζ','προσθετ','σερβιρ','ζυμ','μαγειρ','κρεας','ψαρ','ορνιθ','αυγ','ωο','γαλα','βουτυρ','ελαι','λαδι','αλευρ','ρυζ','ζαχαρ','αλα','πιπερ','κρεμμυ','σκορδ')
+          ingredient_terms=['κρέας','ψάρι','όρνιθα','αυγά','γάλα','βούτυρο','έλαιον','λάδι','άλευρον','ρύζι','ζάχαρη','άλας','αλάτι','πιπέρι','κρεμμύδι','σκόρδο','λεμόνι','ξύδι','οίνος','κρασί','τυρί','πατάτες','φασόλια','αρακάς','ντομάτα','μαϊντανός','κανέλα','αμύγδαλα','σταφίδες','ύδωρ','νερό','ζωμός','αλεύρι']
+          def cooking(s):
+              c=canon(s); return sum(1 for t in cook_terms if t in c)
+
+          # Historical editions commonly number recipes. Prefer numbered starts, then fall back to short title-like lines.
+          numbered=re.compile(r'^(?:[0-9]{1,4}|[Α-Ω]{1,8}|[α-ω]{1,8})[.)΄´:-]+\s+(.{3,100})$')
           starts=[]
           for i,line in enumerate(lines):
-              if not line or len(line)>100: continue
-              if heading_re.match(line) and not cook_re.search(line.casefold()):
-                  nearby=' '.join(lines[i+1:i+7]).casefold()
-                  if cook_re.search(nearby): starts.append(i)
-          starts=sorted(set(starts)); starts.append(len(lines))
-          for a,b in zip(starts,starts[1:]):
-              title=lines[a].strip(' .:-')
-              body=' '.join(x for x in lines[a+1:min(b,a+24)] if x)
-              if len(body)<70: rejected['short']+=1; continue
-              if not cook_re.search(body.casefold()): rejected['non_recipe']+=1; continue
-              if re.search(r'(βλέπε|ίδε|ως ανωτέρω|κατά την υπ αριθ|συνταγ.{0,8}\d+)',body,re.I): rejected['cross_reference']+=1; continue
+              if not line or len(line)>120: continue
+              m=numbered.match(line)
+              if m and cooking(' '.join(lines[i+1:i+10]))>=1:
+                  starts.append(i); continue
+              if 3<=len(line)<=90 and not re.search(r'[.!?;·]$',line) and cooking(line)==0 and cooking(' '.join(lines[i+1:i+8]))>=2:
+                  starts.append(i)
+          starts=sorted(set(starts)); boundaries=starts+[len(lines)]
+          recipes=[]; seen_t=set(); seen_c=set(); rejected={'short':0,'non_recipe':0,'duplicate':0,'incomplete':0,'cross_reference':0}
+          for pos,a in enumerate(starts):
+              b=boundaries[pos+1]
+              title=re.sub(r'^(?:[0-9]{1,4}|[Α-Ω]{1,8}|[α-ω]{1,8})[.)΄´:-]+\s*','',lines[a]).strip(' .:-')
+              body=' '.join(x for x in lines[a+1:min(b,a+35)] if x)
+              if len(body)<60: rejected['short']+=1; continue
+              if cooking(body)<1: rejected['non_recipe']+=1; continue
+              if re.search(r'(βλέπε|ιδε|ως ανωτέρω|κατά την υπ αριθ|συνταγ.{0,10}\d+)',canon(body),re.I): rejected['cross_reference']+=1; continue
               low=canon(body); ingredients=[]
               for t in ingredient_terms:
                   if canon(t) in low: ingredients.append(t)
-              if len(set(map(canon,ingredients)))<2: rejected['incomplete']+=1; continue
+              # Ingredient prose in 19th-century books is embedded in method; require at least one identified ingredient plus cooking action.
+              if len(set(map(canon,ingredients)))<1: rejected['incomplete']+=1; continue
               tk=canon(title); cf=hashlib.sha1(canon(body).encode()).hexdigest()
-              if not tk or tk in seen_t or cf in seen_c: rejected['duplicate']+=1; continue
+              if not tk or len(tk)<3 or tk in seen_t or cf in seen_c: rejected['duplicate']+=1; continue
               seen_t.add(tk); seen_c.add(cf)
               rid='gr-'+hashlib.sha1((title+body).encode()).hexdigest()[:12]
-              recipes.append({'id':rid,'countryID':'gr','name':title,'mealType':'main','description':'Source-grounded historical Greek recipe.','baseServings':0,'prepMinutes':0,'cookMinutes':0,'ingredients':[{'id':str(uuid.uuid5(uuid.NAMESPACE_URL,'remnis-gr:'+x)),'name':x,'amount':0.0,'unit':'','note':None} for x in ingredients],'steps':[body],'tags':['gr','source-grounded','historical'],'provenance':{'creator':'Πλατύς, Σταμάτιος','sourceTitle':'Εγχειρίδιον Μαγειρικής','sourceYear':1883,'sourceURL':Path('greece-source-url.txt').read_text().strip(),'license':'CC0 / Public Domain'}})
-          selected=recipes[:TARGET]
-          status='PASS' if len(selected)>=MINIMUM else 'FAIL'
-          Path('out').mkdir()
+              recipes.append({'id':rid,'countryID':'gr','name':title,'mealType':'main','description':'Source-grounded historical Greek recipe.','baseServings':0,'prepMinutes':0,'cookMinutes':0,'ingredients':[{'id':str(uuid.uuid5(uuid.NAMESPACE_URL,'remnis-gr:'+x)),'name':x,'amount':0.0,'unit':'','note':None} for x in sorted(set(ingredients),key=ingredients.index)],'steps':[body],'tags':['gr','source-grounded','historical'],'provenance':{'creator':'Πλατύς, Σταμάτιος','sourceTitle':'Εγχειρίδιον Μαγειρικής','sourceYear':1883,'sourceURL':'https://www.searchculture.gr/aggregator/edm/amorgos_rep/000159-4399','license':'CC0 / Public Domain'}})
+          selected=recipes[:TARGET]; status='PASS' if len(selected)>=MINIMUM else 'FAIL'
           pack=Path('out/CulinaryRecipes-gr.json'); pack.write_text(json.dumps({'schemaVersion':1,'countryID':'gr','recipes':selected},ensure_ascii=False,separators=(',',':')),encoding='utf-8')
           sha=hashlib.sha256(pack.read_bytes()).hexdigest()
-          report={'countryID':'gr','headingCandidates':len(starts)-1,'uniqueStandaloneRows':len(recipes),'shippedRows':len(selected),'minimumRequired':MINIMUM,'status':status,'sha256':sha,'rejected':rejected,'source':'Εγχειρίδιον Μαγειρικής (1883), SearchCulture CC0'}
+          report={'countryID':'gr','textCharacters':len(text),'headingCandidates':len(starts),'uniqueStandaloneRows':len(recipes),'shippedRows':len(selected),'minimumRequired':MINIMUM,'status':status,'sha256':sha,'rejected':rejected,'source':'Εγχειρίδιον Μαγειρικής (1883), SearchCulture CC0 / Amorgos Library'}
           Path('out/gr-production-report.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
           Path('out/CulinaryRecipes-gr.json.sha256').write_text(sha+'  CulinaryRecipes-gr.json\n')
           print(json.dumps(report,ensure_ascii=False,indent=2))
@@ -132,6 +210,6 @@ jobs:
           path: |
             out/
             greece-source-candidates.json
-            greece-source-url.txt
+            greece-full.txt
           if-no-files-found: warn
           compression-level: 9
