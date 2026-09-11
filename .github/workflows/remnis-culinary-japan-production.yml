@@ -1,0 +1,118 @@
+name: REMNIS Culinary Japan Production
+
+on:
+  push:
+    branches: [remnis-culinary-builder]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-japan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Acquire Japanese cooking corpus
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/yuta1984/honkoku-data.git honkoku
+
+      - name: Build validated Japan pack
+        shell: python
+        run: |
+          import hashlib, json, re, unicodedata, uuid
+          from pathlib import Path
+
+          MINIMUM=300
+          TARGET=350
+          ROOT=Path('honkoku/v3/cooking')
+          recipes=[]
+          seen_titles=set(); seen_content=set()
+          rejected={'incomplete':0,'duplicate':0,'too_short':0,'cross_reference':0,'non_recipe':0}
+
+          def canon(v):
+              v=unicodedata.normalize('NFKC',str(v)).casefold()
+              return re.sub(r'\s+',' ',re.sub(r'[^\w\u3040-\u30ff\u3400-\u9fff]+',' ',v)).strip()
+
+          def fp(parts):
+              return hashlib.sha1('|'.join(canon(x) for x in parts).encode()).hexdigest()
+
+          def clean(s):
+              s=re.sub(r'《.*?》','',s)
+              s=re.sub(r'\[.*?\]','',s)
+              s=re.sub(r'^[-*・●○◎※\s]+','',s)
+              return re.sub(r'\s+',' ',s).strip()
+
+          def infer_title(lines, idx):
+              for j in range(idx, max(-1,idx-5), -1):
+                  t=clean(lines[j])
+                  t=re.sub(r'^[一二三四五六七八九十百千0-9０-９]+[\.、．)]\s*','',t)
+                  if 2 <= len(t) <= 50 and not re.search(r'[。！？]',t): return t
+              return ''
+
+          def flush(title, body, source):
+              body=[clean(x) for x in body if clean(x)]
+              if not title or len(body)<2:
+                  rejected['incomplete']+=1; return
+              txt=''.join(body)
+              if len(txt)<40:
+                  rejected['too_short']+=1; return
+              if re.search(r'(前編|後編|前の|次の).{0,12}(番|項|ページ|頁)',txt):
+                  rejected['cross_reference']+=1; return
+              # Require cooking semantics.
+              if not re.search(r'(煮|焼|蒸|揚|切|刻|和え|漬|炒|炊|茹|ゆで|味噌|醤油|塩|酢|酒|出汁|だし|油|砂糖|米|豆腐|魚|肉|卵|野菜|餅|麺|汁)',txt):
+                  rejected['non_recipe']+=1; return
+              key=canon(title); content_fp=fp(body)
+              if key in seen_titles or content_fp in seen_content:
+                  rejected['duplicate']+=1; return
+              seen_titles.add(key); seen_content.add(content_fp)
+              slug=hashlib.sha1((title+source).encode()).hexdigest()[:12]
+              recipes.append({
+                'id':'jp-'+slug,'countryID':'jp','name':title,'mealType':'main',
+                'description':'Source-grounded Japanese historical recipe.','baseServings':0,'prepMinutes':0,'cookMinutes':0,
+                'ingredients':[],
+                'steps':body,
+                'tags':['jp','source-grounded','historical'],
+                'provenance':{'collection':'yuta1984/honkoku-data','culture':'japan','sourcePath':source,'license':'CC BY-SA 4.0'}
+              })
+
+          for p in sorted(ROOT.rglob('*_ja.txt')):
+              lines=[x.rstrip() for x in p.read_text(encoding='utf-8',errors='ignore').splitlines()]
+              # Entries in these historical books are commonly marked with circles or numbered headings.
+              starts=[]
+              for i,s in enumerate(lines):
+                  st=s.strip()
+                  if re.match(r'^[○●◎]',st) or re.match(r'^[一二三四五六七八九十百千0-9０-９]+[\.、．)]',st):
+                      starts.append(i)
+              if not starts:
+                  continue
+              starts.append(len(lines))
+              for a,b in zip(starts,starts[1:]):
+                  raw=lines[a].strip()
+                  title=clean(re.sub(r'^[○●◎\s]*','',raw))
+                  title=re.sub(r'^[一二三四五六七八九十百千0-9０-９]+[\.、．)]\s*','',title)
+                  if len(title)>60 or re.search(r'[。！？]',title):
+                      title=infer_title(lines,a)
+                  body=lines[a+1:b]
+                  flush(title,body,str(p.relative_to('honkoku')))
+
+          selected=recipes[:TARGET]
+          status='PASS' if len(selected)>=MINIMUM else 'FAIL'
+          Path('out').mkdir()
+          pack=Path('out/CulinaryRecipes-jp.json')
+          pack.write_text(json.dumps({'schemaVersion':1,'countryID':'jp','recipes':selected},ensure_ascii=False,separators=(',',':')),encoding='utf-8')
+          sha=hashlib.sha256(pack.read_bytes()).hexdigest()
+          report={'countryID':'jp','uniqueStandaloneRows':len(recipes),'shippedRows':len(selected),'minimumRequired':MINIMUM,'status':status,'sha256':sha,'rejected':rejected}
+          Path('out/jp-production-report.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
+          Path('out/CulinaryRecipes-jp.json.sha256').write_text(sha+'  CulinaryRecipes-jp.json\n')
+          print(json.dumps(report,ensure_ascii=False,indent=2))
+          if status!='PASS': raise SystemExit('Japan pack failed 300+ gate')
+
+      - name: Upload Japan production artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: remnis-culinary-japan
+          path: out/
+          if-no-files-found: error
+          compression-level: 9
