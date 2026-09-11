@@ -1,0 +1,42 @@
+name: REMNIS Culinary Remaining 4 Audit
+on:
+  push:
+    branches: [remnis-culinary-builder]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Audit China Japan Greece Romania sources
+        shell: python
+        run: |
+          import json, urllib.request
+          from pathlib import Path
+          sources={
+            'cn':'https://raw.githubusercontent.com/AdamBouhmad/open-recipe-archive/main/collections/chinese-cookery/recipes.jsonl',
+            'jp':'https://raw.githubusercontent.com/AdamBouhmad/open-recipe-archive/main/collections/japanese-cookery/recipes.jsonl'
+          }
+          report=[]
+          for cid,url in sources.items():
+            try:
+              data=urllib.request.urlopen(url,timeout=30).read().decode('utf-8')
+              rows=[json.loads(x) for x in data.splitlines() if x.strip()]
+              report.append({'countryID':cid,'source':url,'rawRows':len(rows),'status':'DOWNLOADED'})
+            except Exception as e:
+              report.append({'countryID':cid,'source':url,'rawRows':0,'status':'SOURCE_UNAVAILABLE','error':str(e)})
+          # These two require the previously identified historical normalization pipelines;
+          # do not invent completion counts before their source material is acquired.
+          report += [
+            {'countryID':'gr','source':'Stamatios Platys, Egcheiridion Mageirikis (1883), Public Domain/CC0','rawRows':0,'status':'HISTORICAL_SOURCE_REQUIRES_EXTRACTION'},
+            {'countryID':'ro','source':'Ecaterina Dr. S. Comsa, Buna menajera sau Carte de bucate (1902)','rawRows':0,'status':'HISTORICAL_SOURCE_REQUIRES_NORMALIZATION'}
+          ]
+          Path('remaining-4-source-audit.json').write_text(json.dumps(report,ensure_ascii=False,indent=2))
+          print(json.dumps(report,ensure_ascii=False,indent=2))
+      - name: Upload audit evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: remnis-culinary-remaining-4-audit
+          path: remaining-4-source-audit.json
+          if-no-files-found: error
