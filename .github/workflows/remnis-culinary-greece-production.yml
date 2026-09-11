@@ -1,0 +1,125 @@
+name: REMNIS Culinary Greece Production
+
+on:
+  push:
+    branches: [remnis-culinary-builder]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-greece:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install extraction tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils
+          python -m pip install --quiet requests beautifulsoup4
+
+      - name: Acquire public-domain Greek cookbook
+        shell: python
+        run: |
+          import json, re, requests
+          from bs4 import BeautifulSoup
+          from pathlib import Path
+
+          ITEM='https://www.searchculture.gr/aggregator/edm/amorgos_rep/000159-4399?language=en'
+          s=requests.Session(); s.headers.update({'User-Agent':'Mozilla/5.0 REMNIS-Culinary/1.0'})
+          html=s.get(ITEM,timeout=60).text
+          Path('searchculture-item.html').write_text(html,encoding='utf-8')
+          soup=BeautifulSoup(html,'html.parser')
+          candidates=[]
+          for a in soup.find_all('a',href=True):
+              href=a['href']
+              text=' '.join(a.get_text(' ',strip=True).split()).casefold()
+              if '.pdf' in href.casefold() or 'digital file' in text or 'download' in text:
+                  candidates.append(requests.compat.urljoin(ITEM,href))
+          # Also inspect embedded JSON/metadata for direct PDF URLs.
+          for m in re.findall(r'https?[^\"\'<> ]+',html):
+              u=m.replace('&amp;','&')
+              if '.pdf' in u.casefold() and u not in candidates: candidates.append(u)
+          print('candidate URLs:', json.dumps(candidates,ensure_ascii=False,indent=2))
+          Path('greece-source-candidates.json').write_text(json.dumps(candidates,ensure_ascii=False,indent=2))
+          for url in candidates:
+              try:
+                  r=s.get(url,timeout=90,allow_redirects=True)
+                  ct=r.headers.get('content-type','').casefold()
+                  if r.status_code==200 and (r.content[:4]==b'%PDF' or 'pdf' in ct) and len(r.content)>50000:
+                      Path('greece.pdf').write_bytes(r.content)
+                      Path('greece-source-url.txt').write_text(r.url)
+                      print('downloaded',r.url,len(r.content))
+                      break
+              except Exception as e:
+                  print('candidate failed',url,e)
+          if not Path('greece.pdf').exists():
+              raise SystemExit('Could not resolve the SearchCulture PDF download URL')
+
+      - name: Extract and build Greece pack
+        run: |
+          set -euo pipefail
+          pdftotext -layout greece.pdf greece.txt
+          python - <<'PY'
+          import hashlib,json,re,unicodedata,uuid
+          from pathlib import Path
+          MINIMUM=300; TARGET=350
+          text=Path('greece.txt').read_text(encoding='utf-8',errors='ignore')
+          # Normalize historic Greek while preserving content.
+          text=text.replace('\u00ad','')
+          lines=[re.sub(r'\s+',' ',x).strip() for x in text.splitlines()]
+          heading_re=re.compile(r'^(?:[Α-ΩϚϛ͵0-9]+[.)΄´-]?\s*)?([Ά-ώἀ-῾A-Za-z][^.!?]{2,90})$')
+          cook_re=re.compile(r'(βράζ|βραζ|ψήν|ψην|τηγαν|κόπτ|κοπτ|κόβ|κοβ|ανακατεύ|ρίπτ|ριπτ|βάζ|βαζ|προσθέτ|προσθετ|σερβίρ|σερβιρ|ζύμ|ζυμ|σάλτσ|σαλτσ|κρέας|κρεας|ψάρι|ψαρι|όρνιθ|ορνιθ|αυγ|ωό|γάλα|γαλα|βούτυρ|βουτυρ|έλαι|ελαι|λάδι|λαδι|άλευρ|αλευρ|ρύζ|ρυζ|ζάχαρ|ζαχαρ|άλας|αλατ|πιπέρι|πιπερι|κρεμμύ|κρεμμυ|σκόρδ|σκορδ)')
+          ingredient_terms=['κρέας','ψάρι','όρνιθα','αυγά','γάλα','βούτυρο','έλαιον','λάδι','άλευρον','ρύζι','ζάχαρη','άλας','αλάτι','πιπέρι','κρεμμύδι','σκόρδο','λεμόνι','ξύδι','οίνος','κρασί','τυρί','πατάτες','φασόλια','αρακάς','ντομάτα','μαϊντανός','κανέλα','αμύγδαλα','σταφίδες']
+          def canon(v):
+              v=unicodedata.normalize('NFKD',str(v)).casefold()
+              v=''.join(c for c in v if not unicodedata.combining(c))
+              return re.sub(r'[^a-zα-ω0-9]+',' ',v).strip()
+          recipes=[]; seen_t=set(); seen_c=set(); rejected={'short':0,'non_recipe':0,'duplicate':0,'incomplete':0,'cross_reference':0}
+          starts=[]
+          for i,line in enumerate(lines):
+              if not line or len(line)>100: continue
+              if heading_re.match(line) and not cook_re.search(line.casefold()):
+                  # Historical recipe titles are short standalone lines; require nearby cooking prose.
+                  nearby=' '.join(lines[i+1:i+7]).casefold()
+                  if cook_re.search(nearby): starts.append(i)
+          starts=sorted(set(starts)); starts.append(len(lines))
+          for a,b in zip(starts,starts[1:]):
+              title=lines[a].strip(' .:-')
+              body=' '.join(x for x in lines[a+1:min(b,a+24)] if x)
+              if len(body)<70: rejected['short']+=1; continue
+              if not cook_re.search(body.casefold()): rejected['non_recipe']+=1; continue
+              if re.search(r'(βλέπε|ίδε|ως ανωτέρω|κατά την υπ αριθ|συνταγ.{0,8}\d+)',body,re.I): rejected['cross_reference']+=1; continue
+              low=canon(body); ingredients=[]
+              for t in ingredient_terms:
+                  if canon(t) in low: ingredients.append(t)
+              # Some historical recipes don't enumerate ingredients separately; require 2 identifiable food ingredients.
+              if len(set(map(canon,ingredients)))<2: rejected['incomplete']+=1; continue
+              tk=canon(title); cf=hashlib.sha1(canon(body).encode()).hexdigest()
+              if not tk or tk in seen_t or cf in seen_c: rejected['duplicate']+=1; continue
+              seen_t.add(tk); seen_c.add(cf)
+              rid='gr-'+hashlib.sha1((title+body).encode()).hexdigest()[:12]
+              recipes.append({'id':rid,'countryID':'gr','name':title,'mealType':'main','description':'Source-grounded historical Greek recipe.','baseServings':0,'prepMinutes':0,'cookMinutes':0,'ingredients':[{'id':str(uuid.uuid5(uuid.NAMESPACE_URL,'remnis-gr:'+x)),'name':x,'amount':0.0,'unit':'','note':None} for x in ingredients],'steps':[body],'tags':['gr','source-grounded','historical'],'provenance':{'creator':'Πλατύς, Σταμάτιος','sourceTitle':'Εγχειρίδιον Μαγειρικής','sourceYear':1883,'sourceURL':Path('greece-source-url.txt').read_text().strip(),'license':'CC0 / Public Domain'}})
+          selected=recipes[:TARGET]
+          status='PASS' if len(selected)>=MINIMUM else 'FAIL'
+          Path('out').mkdir()
+          pack=Path('out/CulinaryRecipes-gr.json'); pack.write_text(json.dumps({'schemaVersion':1,'countryID':'gr','recipes':selected},ensure_ascii=False,separators=(',',':')),encoding='utf-8')
+          sha=hashlib.sha256(pack.read_bytes()).hexdigest()
+          report={'countryID':'gr','headingCandidates':len(starts)-1,'uniqueStandaloneRows':len(recipes),'shippedRows':len(selected),'minimumRequired':MINIMUM,'status':status,'sha256':sha,'rejected':rejected,'source':'Εγχειρίδιον Μαγειρικής (1883), SearchCulture CC0'}
+          Path('out/gr-production-report.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
+          Path('out/CulinaryRecipes-gr.json.sha256').write_text(sha+'  CulinaryRecipes-gr.json\n')
+          print(json.dumps(report,ensure_ascii=False,indent=2))
+          if status!='PASS': raise SystemExit('Greece pack failed 300+ gate')
+          PY
+
+      - name: Upload Greece production evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: remnis-culinary-greece
+          path: |
+            out/
+            greece-source-candidates.json
+            greece-source-url.txt
+          if-no-files-found: warn
+          compression-level: 9
