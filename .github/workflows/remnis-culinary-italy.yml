@@ -1,0 +1,144 @@
+name: REMNIS Culinary Italy Builder
+
+on:
+  push:
+    branches: [remnis-culinary-builder]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  SOURCE_URL: https://raw.githubusercontent.com/AdamBouhmad/open-recipe-archive/main/collections/cucina-italiana/recipes.jsonl
+
+jobs:
+  build-italy-pack:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download verified public-domain source
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 4 --retry-delay 2 "$SOURCE_URL" -o italy-source.jsonl
+          test "$(wc -c < italy-source.jsonl)" -gt 1000000
+          test "$(wc -l < italy-source.jsonl)" -gt 700
+
+      - name: Build REMNIS Italy pack
+        shell: python
+        run: |
+          import hashlib, json, re, unicodedata, uuid
+          from pathlib import Path
+
+          source = Path('italy-source.jsonl')
+          out = Path('CulinaryRecipes-it.json')
+          report = Path('italy-production-report.json')
+          allowed = {'public-domain', 'cc0', 'unlicense'}
+          cross_refs = (
+              re.compile(r'\b(?:as|like|according to|same as)\s+(?:recipe\s+)?(?:no\.?|number)\s*\d+\b', re.I),
+              re.compile(r'\b(?:see|refer to|prepare as|made as)\s+(?:recipe\s+)?(?:no\.?|number)?\s*\d+\b', re.I),
+              re.compile(r'\brecipe\s+(?:n\.?|no\.?|number)\s*\d+\b', re.I),
+          )
+          homoglyphs = str.maketrans({'а':'a','е':'e','о':'o','р':'p','с':'c','х':'x','у':'y'})
+
+          def canonical(v):
+              v = str(v).translate(homoglyphs)
+              v = unicodedata.normalize('NFKD', v)
+              v = ''.join(ch for ch in v if not unicodedata.combining(ch))
+              return re.sub(r'[^a-z0-9]+', ' ', v.casefold()).strip()
+
+          def sections(body):
+              ing, steps, mode = [], [], None
+              for raw in body.splitlines():
+                  line = raw.strip()
+                  if not line: continue
+                  low = line.casefold().strip('#: ')
+                  if low.startswith(('ingredient','materials')):
+                      mode='ingredients'; continue
+                  if low.startswith(('direction','instruction','method','preparation','procedure')):
+                      mode='steps'; continue
+                  text = re.sub(r'^[-*]\s*', '', line)
+                  text = re.sub(r'^\d+[.)]\s*', '', text)
+                  if line.startswith('#'): continue
+                  if mode == 'ingredients': ing.append(text)
+                  elif mode == 'steps': steps.append(text)
+              return ing, steps
+
+          def has_crossref(lines):
+              text = ' '.join(lines)
+              return any(p.search(text) for p in cross_refs)
+
+          def fingerprint(ing, steps):
+              payload = '|'.join(canonical(x) for x in ing + steps if canonical(x))
+              return hashlib.sha1(payload.encode()).hexdigest()
+
+          raw=licensed=structured=0
+          rejected={'invalid_json':0,'wrong_culture':0,'license':0,'incomplete':0,'cross_reference':0,'duplicate':0}
+          recipes=[]; seen_names=set(); seen_content=set()
+          with source.open(encoding='utf-8') as f:
+              for line in f:
+                  if not line.strip(): continue
+                  raw += 1
+                  try: obj=json.loads(line)
+                  except Exception:
+                      rejected['invalid_json'] += 1; continue
+                  if str(obj.get('culture','')).casefold() != 'italy':
+                      rejected['wrong_culture'] += 1; continue
+                  if str(obj.get('license','')).casefold() not in allowed:
+                      rejected['license'] += 1; continue
+                  licensed += 1
+                  title=str(obj.get('title','')).strip(); body=str(obj.get('body',''))
+                  ing,steps=sections(body)
+                  if not title or not ing or not steps:
+                      rejected['incomplete'] += 1; continue
+                  if has_crossref(ing+steps):
+                      rejected['cross_reference'] += 1; continue
+                  structured += 1
+                  name_key=canonical(title); fp=fingerprint(ing,steps)
+                  if name_key in seen_names or fp in seen_content:
+                      rejected['duplicate'] += 1; continue
+                  seen_names.add(name_key); seen_content.add(fp)
+                  source_url=str(obj.get('source_url',''))
+                  slug=re.sub(r'[^a-z0-9]+','-',canonical(title)).strip('-')[:70] or 'recipe'
+                  rid=f"it-{slug}-{hashlib.sha1((title+'|'+source_url).encode()).hexdigest()[:9]}"
+                  ingredients=[{
+                      'id': str(uuid.uuid5(uuid.NAMESPACE_URL,'remnis-ingredient:'+x)),
+                      'name': x, 'amount': 0.0, 'unit': '', 'note': None
+                  } for x in ing]
+                  recipes.append({
+                      'id':rid,'countryID':'it','name':title,'mealType':'main',
+                      'description':f"From {obj.get('source_title') or 'a public-domain Italian cookbook'}.",
+                      'baseServings':0,'prepMinutes':0,'cookMinutes':0,
+                      'ingredients':ingredients,'steps':steps,
+                      'tags':['it','bundled','source-grounded'],
+                      'provenance':{
+                          'collection':obj.get('collection'),'culture':obj.get('culture'),
+                          'author':obj.get('author'),'sourceTitle':obj.get('source_title'),
+                          'sourceURL':source_url,'sourceYear':obj.get('source_year'),'license':obj.get('license')
+                      }
+                  })
+
+          selected=recipes[:350]
+          if len(selected) < 300:
+              raise SystemExit(f'Italy FAIL: only {len(selected)} valid unique standalone recipes after filtering')
+          envelope={'schemaVersion':1,'countryID':'it','recipes':selected}
+          out.write_text(json.dumps(envelope,ensure_ascii=False,separators=(',',':')),encoding='utf-8')
+          digest=hashlib.sha256(out.read_bytes()).hexdigest()
+          report.write_text(json.dumps({
+              'countryID':'it','sourceURL':str(source),'rawRows':raw,'licensedRows':licensed,
+              'structurallyCompleteRows':structured,'uniqueStandaloneRows':len(recipes),
+              'shippedRows':len(selected),'minimumRequired':300,'status':'PASS',
+              'sha256':digest,'rejected':rejected
+          },indent=2),encoding='utf-8')
+          Path('CulinaryRecipes-it.json.sha256').write_text(digest+'  CulinaryRecipes-it.json\n')
+          print(f'ITALY PASS: {len(selected)} shipped from {len(recipes)} unique standalone candidates')
+          print(f'SHA256: {digest}')
+
+      - name: Upload production evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: remnis-culinary-italy
+          path: |
+            CulinaryRecipes-it.json
+            CulinaryRecipes-it.json.sha256
+            italy-production-report.json
+          if-no-files-found: error
+          compression-level: 9
