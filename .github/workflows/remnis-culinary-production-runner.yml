@@ -1,0 +1,181 @@
+name: REMNIS Culinary Production Runner
+
+on:
+  push:
+    branches:
+      - remnis-culinary-production-20260911
+    paths:
+      - '.github/workflows/remnis-culinary-production-runner.yml'
+      - 'remnis-culinary/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  acquire:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Unpack isolated REMNIS scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p runner work out reports
+          base64 -d remnis-culinary/runner_bundle.tar.gz.b64 > runner_bundle.tar.gz
+          tar -xzf runner_bundle.tar.gz -C runner
+          chmod +x runner/Scripts/*.py
+
+      - name: China - HowToCook reusable corpus
+        shell: bash
+        run: |
+          set +e
+          git clone --depth 1 https://github.com/Anduin2017/HowToCook.git work/HowToCook
+          CLONE_RC=$?
+          if [ "$CLONE_RC" -eq 0 ]; then
+            python3 runner/Scripts/import_howtocook_china.py --repo work/HowToCook --output work/china-howtocook.jsonl --minimum 300
+            PARSE_RC=$?
+            if [ -s work/china-howtocook.jsonl ]; then
+              python3 runner/Scripts/import_remnis_recipe_source.py --input work/china-howtocook.jsonl --output out --target 350
+              IMPORT_RC=$?
+            else
+              IMPORT_RC=99
+            fi
+          else
+            PARSE_RC=99
+            IMPORT_RC=99
+          fi
+          printf '{"clone":%s,"parse":%s,"import":%s}\n' "$CLONE_RC" "$PARSE_RC" "$IMPORT_RC" > reports/cn-stage.json
+          exit 0
+
+      - name: Romania - Buna menajera 1902
+        shell: bash
+        run: |
+          set +e
+          python3 runner/Scripts/acquire_romanian_buna_menajera.py --url --output work/romania-raw.jsonl
+          ACQ_RC=$?
+          if [ -s work/romania-raw.jsonl ]; then
+            python3 runner/Scripts/normalize_romanian_buna_menajera.py --input work/romania-raw.jsonl --output work/romania-normalized.jsonl --rejected reports/romania-rejected.json --minimum-normalized 300
+            NORM_RC=$?
+            if [ -s work/romania-normalized.jsonl ]; then
+              python3 runner/Scripts/import_remnis_recipe_source.py --input work/romania-normalized.jsonl --output out --target 350
+              IMPORT_RC=$?
+            else
+              IMPORT_RC=99
+            fi
+          else
+            NORM_RC=99
+            IMPORT_RC=99
+          fi
+          printf '{"acquire":%s,"normalize":%s,"import":%s}\n' "$ACQ_RC" "$NORM_RC" "$IMPORT_RC" > reports/ro-stage.json
+          exit 0
+
+      - name: Greece - reusable wider web
+        shell: bash
+        run: |
+          set +e
+          python3 runner/Scripts/acquire_mediawiki_cuisine.py --api 'https://recipes.fandom.com/api.php' --base 'https://recipes.fandom.com' --category 'Category:Greek Recipes' --country gr --output work/greece-fandom.jsonl --source-title 'Recipes Wiki - Greek Recipes' --license cc-by-sa-4.0 --attribution 'Recipes Wiki contributors; CC BY-SA' --depth 3
+          FANDOM_RC=$?
+          python3 runner/Scripts/acquire_greece_open_web.py --output work/greece-openweb.jsonl --report reports/greece-openweb-report.json
+          OPEN_RC=$?
+          : > work/greece-empty.jsonl
+          INPUTS=()
+          [ -s work/greece-fandom.jsonl ] && INPUTS+=(work/greece-fandom.jsonl)
+          [ -s work/greece-openweb.jsonl ] && INPUTS+=(work/greece-openweb.jsonl)
+          [ ${#INPUTS[@]} -eq 0 ] && INPUTS+=(work/greece-empty.jsonl)
+          python3 runner/Scripts/produce_greece_multisource.py "${INPUTS[@]}" --output out/CulinaryRecipes-gr.json --report reports/greece-production-report.json --minimum 300 --target 350
+          MERGE_RC=$?
+          printf '{"fandom":%s,"openWeb":%s,"merge":%s}\n' "$FANDOM_RC" "$OPEN_RC" "$MERGE_RC" > reports/gr-stage.json
+          exit 0
+
+      - name: Japan - historical transcriptions plus recipe wiki
+        shell: bash
+        run: |
+          set +e
+          git clone --depth 1 https://github.com/yuta1984/honkoku-data.git work/honkoku-data
+          CLONE_RC=$?
+          if [ "$CLONE_RC" -eq 0 ]; then
+            python3 runner/Scripts/acquire_japan_historical_transcriptions.py --repo work/honkoku-data --output work/japan-historical-raw.jsonl --minimum-source-recipes 300
+            HIST_ACQ_RC=$?
+            if [ -s work/japan-historical-raw.jsonl ]; then
+              python3 runner/Scripts/normalize_japan_historical_transcriptions.py --input work/japan-historical-raw.jsonl --output work/japan-historical.jsonl --rejected reports/japan-historical-rejected.json --minimum-normalized 0
+              HIST_NORM_RC=$?
+            else
+              HIST_NORM_RC=99
+            fi
+          else
+            HIST_ACQ_RC=99
+            HIST_NORM_RC=99
+          fi
+          python3 runner/Scripts/acquire_mediawiki_cuisine.py --api 'https://japaneserecipes.fandom.com/api.php' --base 'https://japaneserecipes.fandom.com' --category 'Category:Recipes' --country jp --output work/japan-fandom.jsonl --source-title 'Japanese Recipes Wiki' --license cc-by-sa-4.0 --attribution 'Japanese Recipes Wiki contributors; CC BY-SA' --depth 4
+          FANDOM_RC=$?
+          cat work/japan-historical.jsonl work/japan-fandom.jsonl 2>/dev/null > work/japan-merged.jsonl || true
+          if [ -s work/japan-merged.jsonl ]; then
+            python3 runner/Scripts/import_remnis_recipe_source.py --input work/japan-merged.jsonl --output out --target 350
+            IMPORT_RC=$?
+          else
+            IMPORT_RC=99
+          fi
+          printf '{"clone":%s,"historicalAcquire":%s,"historicalNormalize":%s,"fandom":%s,"import":%s}\n' "$CLONE_RC" "$HIST_ACQ_RC" "$HIST_NORM_RC" "$FANDOM_RC" "$IMPORT_RC" > reports/jp-stage.json
+          exit 0
+
+      - name: Audit produced cuisine packs
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, pathlib, re
+          out = pathlib.Path('out')
+          report = {'schemaVersion': 1, 'minimumRequired': 300, 'cuisines': {}, 'releaseGate': 'BELOW_MINIMUM'}
+          all_pass = True
+          for cid in ('ro','gr','cn','jp'):
+              p = out / f'CulinaryRecipes-{cid}.json'
+              r = {'file': p.name, 'exists': p.exists(), 'count': 0, 'completeCount': 0, 'uniqueTitles': 0, 'uniqueContent': 0, 'status': 'MISSING'}
+              if p.exists():
+                  try:
+                      obj = json.loads(p.read_text(encoding='utf-8'))
+                      rows = obj.get('recipes', [])
+                      titles = set()
+                      content = set()
+                      complete = 0
+                      for x in rows:
+                          name = re.sub(r'\s+', ' ', str(x.get('name','')).casefold()).strip()
+                          ings = [i for i in x.get('ingredients',[]) if str(i.get('name','') if isinstance(i,dict) else i).strip()]
+                          steps = [str(s).strip() for s in x.get('steps',[]) if str(s).strip()]
+                          if name and len(ings) >= 2 and len(steps) >= 2:
+                              complete += 1
+                          if name:
+                              titles.add(name)
+                          fp = hashlib.sha1((json.dumps(ings, sort_keys=True, ensure_ascii=False)+'|'+json.dumps(steps, ensure_ascii=False)).encode()).hexdigest()
+                          content.add(fp)
+                      r.update(count=len(rows), completeCount=complete, uniqueTitles=len(titles), uniqueContent=len(content), sha256=hashlib.sha256(p.read_bytes()).hexdigest())
+                      ok = len(rows) >= 300 and complete >= 300 and len(titles) == len(rows) and len(content) == len(rows)
+                      r['status'] = 'PASS' if ok else 'BELOW_MINIMUM'
+                  except Exception as e:
+                      r['status'] = 'INVALID'
+                      r['error'] = str(e)
+              if r['status'] != 'PASS':
+                  all_pass = False
+              report['cuisines'][cid] = r
+          report['releaseGate'] = 'PASS' if all_pass else 'BELOW_MINIMUM'
+          pathlib.Path('reports/production-summary.json').write_text(json.dumps(report, ensure_ascii=False, indent=2)+'\n', encoding='utf-8')
+          print(json.dumps(report, ensure_ascii=False, indent=2))
+          PY
+
+      - name: Upload all candidate packs and evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: remnis-culinary-production-results
+          if-no-files-found: warn
+          retention-days: 7
+          path: |
+            out/CulinaryRecipes-*.json
+            reports/*.json
+            work/*.jsonl
+            work/*.report.json
