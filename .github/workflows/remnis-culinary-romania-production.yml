@@ -1,0 +1,116 @@
+name: REMNIS Culinary Romania Production
+
+on:
+  push:
+    branches: [remnis-culinary-builder]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-romania:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install parser dependencies
+        run: python -m pip install --quiet requests beautifulsoup4
+
+      - name: Build validated Romania pack
+        shell: python
+        run: |
+          import hashlib, json, re, unicodedata, uuid
+          from pathlib import Path
+          import requests
+          from bs4 import BeautifulSoup
+
+          SOURCE='https://llll.ro/ecaterina-comsa/buna-menajera/'
+          MINIMUM=300
+          TARGET=350
+          html=requests.get(SOURCE,timeout=60,headers={'User-Agent':'REMNIS-Culinary/1.0'}).text
+          soup=BeautifulSoup(html,'html.parser')
+          recipes=[]; seen_titles=set(); seen_content=set()
+          rejected={'incomplete':0,'duplicate':0,'cross_reference':0,'non_recipe':0}
+
+          food_terms=[
+            'carne','pui','vitel','vițel','porc','miel','vacă','peste','pește','raci','ou','ouă','ouě','lapte','smântână','unt','untură','făină','zahăr','sare','piper','oțet','otet','lămâie','lămâe','ceapă','cépă','usturoi','morcov','pătrunjel','țelină','telină','cartof','varză','orez','fasole','mazere','mazère','linte','ciuperci','conopidă','franzelă','pesmet','ulei','untdelemn','brânză','branza','caș','cascaval','cașcaval','roșii','patlagele','măsline','capere','tarhon','măcriș','macris','cimbru','boia','scorțișoară','scortisoara','vanilie','nuci','migdale','stafide','mere','pere','prune','cireșe','cirese','caise','piersici','struguri','miere','ciocolată','cacao','gelatină','drojdie'
+          ]
+          cook_re=re.compile(r'\b(?:fierb|ferb|férb|fiert|prăj|praj|frig|coc|cócem|tăem|tăiem|toc|mestec|punem|adăog|adaug|strecur|serv|batem|curăț|curat|spăl|spal|rumen|coacem|coace|frigem)\w*',re.I)
+          cross_re=re.compile(r'\b(?:ca|precum|după)\s+(?:la|în)\s+(?:rețeta|reteta|numărul|numarul|nr\.?|no\.?)\s*\d+',re.I)
+
+          def canon(v):
+              v=unicodedata.normalize('NFKD',str(v))
+              v=''.join(ch for ch in v if not unicodedata.combining(ch))
+              return re.sub(r'[^a-z0-9]+',' ',v.casefold()).strip()
+
+          def add(title, body, number):
+              body=' '.join(body.split())
+              if len(body)<80 or not cook_re.search(body):
+                  rejected['non_recipe']+=1; return
+              if cross_re.search(body):
+                  rejected['cross_reference']+=1; return
+              ingredients=[]
+              low=body.casefold()
+              for term in food_terms:
+                  if term.casefold() in low:
+                      key=canon(term)
+                      if key and key not in {canon(x) for x in ingredients}:
+                          ingredients.append(term)
+              if len(ingredients)<2:
+                  rejected['incomplete']+=1; return
+              title=re.sub(r'^\s*\d+\s*[.)-]\s*','',title).strip(' .')
+              key=canon(title)
+              content_fp=hashlib.sha1(canon(body).encode()).hexdigest()
+              if not key or key in seen_titles or content_fp in seen_content:
+                  rejected['duplicate']+=1; return
+              seen_titles.add(key); seen_content.add(content_fp)
+              rid=f"ro-{number}-{hashlib.sha1((title+body).encode()).hexdigest()[:9]}"
+              recipes.append({
+                'id':rid,'countryID':'ro','name':title,'mealType':'main',
+                'description':'Historical Romanian recipe from Ecaterina Dr. S. Comșa, Buna menajeră sau Carte de bucate (1902).',
+                'baseServings':0,'prepMinutes':0,'cookMinutes':0,
+                'ingredients':[{'id':str(uuid.uuid5(uuid.NAMESPACE_URL,'remnis-ro:'+x)),'name':x,'amount':0.0,'unit':'','note':None} for x in ingredients],
+                'steps':[body],'tags':['ro','source-grounded','historical'],
+                'provenance':{'author':'Ecaterina Dr. S. Comșa','sourceTitle':'Buna menajeră sau Carte de bucate','sourceYear':1902,'sourceURL':SOURCE,'authorDeathYear':1928,'license':'public-domain'}
+              })
+
+          headings=[]
+          for h in soup.find_all(['h3','h4']):
+              txt=' '.join(h.get_text(' ',strip=True).split())
+              m=re.match(r'^(\d{1,4})\.\s*(.+)$',txt)
+              if m: headings.append((h,int(m.group(1)),m.group(2)))
+
+          for h,num,title in headings:
+              chunks=[]
+              node=h.next_sibling
+              while node is not None:
+                  name=getattr(node,'name',None)
+                  if name in ('h2','h3','h4'):
+                      break
+                  if hasattr(node,'get_text'):
+                      t=node.get_text(' ',strip=True)
+                  else:
+                      t=str(node).strip()
+                  if t: chunks.append(t)
+                  node=node.next_sibling
+              add(title,' '.join(chunks),num)
+
+          selected=recipes[:TARGET]
+          status='PASS' if len(selected)>=MINIMUM else 'FAIL'
+          Path('out').mkdir()
+          pack=Path('out/CulinaryRecipes-ro.json')
+          pack.write_text(json.dumps({'schemaVersion':1,'countryID':'ro','recipes':selected},ensure_ascii=False,separators=(',',':')),encoding='utf-8')
+          sha=hashlib.sha256(pack.read_bytes()).hexdigest()
+          report={'countryID':'ro','headingsFound':len(headings),'uniqueStandaloneRows':len(recipes),'shippedRows':len(selected),'minimumRequired':MINIMUM,'status':status,'sha256':sha,'rejected':rejected,'source':SOURCE}
+          Path('out/ro-production-report.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
+          Path('out/CulinaryRecipes-ro.json.sha256').write_text(sha+'  CulinaryRecipes-ro.json\n')
+          print(json.dumps(report,ensure_ascii=False,indent=2))
+          if status!='PASS': raise SystemExit('Romania pack failed 300+ gate')
+
+      - name: Upload Romania production artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: remnis-culinary-romania
+          path: out/
+          if-no-files-found: error
+          compression-level: 9
