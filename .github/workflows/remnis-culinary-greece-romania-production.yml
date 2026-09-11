@@ -1,0 +1,160 @@
+name: REMNIS Culinary Greece Romania Production
+
+on:
+  push:
+    branches: [remnis-culinary-builder]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-last-two:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install extraction tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils python3-bs4
+
+      - name: Build Romania pack from 1902 digital edition
+        shell: python
+        run: |
+          import hashlib, json, re, unicodedata, urllib.request, uuid
+          from bs4 import BeautifulSoup
+          from pathlib import Path
+
+          URL='https://llll.ro/ecaterina-comsa/buna-menajera/'
+          html=urllib.request.urlopen(URL,timeout=60).read().decode('utf-8','replace')
+          soup=BeautifulSoup(html,'html.parser')
+          recipes=[]; seen=set(); seen_fp=set(); rejected={'short':0,'duplicate':0,'cross_reference':0}
+
+          def canon(s):
+              s=unicodedata.normalize('NFKD',s)
+              s=''.join(c for c in s if not unicodedata.combining(c))
+              return re.sub(r'[^a-z0-9]+',' ',s.casefold()).strip()
+
+          headings=[]
+          for h in soup.find_all(['h2','h3','h4']):
+              t=' '.join(h.get_text(' ',strip=True).split())
+              m=re.match(r'^(\d{1,4})\.\s+(.+)$',t)
+              if m: headings.append((h,int(m.group(1)),m.group(2).strip()))
+
+          for h,num,title in headings:
+              body=[]
+              for node in h.next_siblings:
+                  name=getattr(node,'name',None)
+                  if name in ('h2','h3','h4'):
+                      break
+                  if hasattr(node,'get_text'):
+                      txt=' '.join(node.get_text(' ',strip=True).split())
+                  else:
+                      txt=' '.join(str(node).split())
+                  if txt: body.append(txt)
+              text=' '.join(body).strip()
+              if len(text)<60:
+                  rejected['short']+=1; continue
+              if re.search(r'\b(?:vezi|vedi|ca la|după cum la)\b.{0,30}\b(?:nr\.?|numărul)?\s*\d+',text,re.I):
+                  rejected['cross_reference']+=1; continue
+              key=canon(title); fp=hashlib.sha1(canon(text).encode()).hexdigest()
+              if key in seen or fp in seen_fp:
+                  rejected['duplicate']+=1; continue
+              seen.add(key); seen_fp.add(fp)
+              rid=f"ro-{num:04d}-{hashlib.sha1(title.encode()).hexdigest()[:8]}"
+              recipes.append({
+                  'id':rid,'countryID':'ro','name':title,'mealType':'main',
+                  'description':'Source-grounded Romanian historical recipe.',
+                  'baseServings':0,'prepMinutes':0,'cookMinutes':0,
+                  'ingredients':[], 'steps':[text],
+                  'tags':['ro','source-grounded','historical'],
+                  'provenance':{'sourceTitle':'Buna menajera sau Carte de bucate','author':'Ecaterina Dr. S. Comsa','year':1902,'sourceURL':URL,'licenseBasis':'public-domain historical edition; digital transcription source retained for attribution'}
+              })
+
+          Path('out').mkdir(exist_ok=True)
+          selected=recipes[:350]
+          status='PASS' if len(selected)>=300 else 'FAIL'
+          pack=Path('out/CulinaryRecipes-ro.json')
+          pack.write_text(json.dumps({'schemaVersion':1,'countryID':'ro','recipes':selected},ensure_ascii=False,separators=(',',':')),encoding='utf-8')
+          sha=hashlib.sha256(pack.read_bytes()).hexdigest()
+          report={'countryID':'ro','detectedNumberedRecipes':len(headings),'uniqueStandaloneRows':len(recipes),'shippedRows':len(selected),'minimumRequired':300,'status':status,'sha256':sha,'rejected':rejected}
+          Path('out/ro-production-report.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
+          Path('out/CulinaryRecipes-ro.json.sha256').write_text(sha+'  CulinaryRecipes-ro.json\n')
+          print(json.dumps(report,ensure_ascii=False,indent=2))
+          if status!='PASS': raise SystemExit('Romania pack failed 300+ gate')
+
+      - name: Acquire Greek CC0 PDF
+        shell: python
+        run: |
+          import re, urllib.request
+          from pathlib import Path
+          page='https://www.searchculture.gr/aggregator/edm/amorgos_rep/000159-4399?language=en'
+          html=urllib.request.urlopen(page,timeout=60).read().decode('utf-8','replace')
+          urls=re.findall(r'https?://[^\"\'<> ]+',html)
+          candidates=[]
+          for u in urls:
+              ul=u.lower()
+              if '.pdf' in ul or 'digital' in ul or 'download' in ul or 'bitstream' in ul:
+                  candidates.append(u.replace('&amp;','&'))
+          Path('greek-source-candidates.txt').write_text('\n'.join(dict.fromkeys(candidates)),encoding='utf-8')
+          print('\n'.join(dict.fromkeys(candidates))[:10000])
+
+      - name: Build Greece pack if digital file is discoverable
+        shell: python
+        run: |
+          import hashlib, json, re, subprocess, urllib.request, unicodedata, uuid
+          from pathlib import Path
+          outdir=Path('out'); outdir.mkdir(exist_ok=True)
+          candidates=Path('greek-source-candidates.txt').read_text(encoding='utf-8').splitlines()
+          pdf=None; used=None
+          for u in candidates:
+              try:
+                  req=urllib.request.Request(u,headers={'User-Agent':'Mozilla/5.0'})
+                  data=urllib.request.urlopen(req,timeout=60).read()
+                  if data.startswith(b'%PDF') and len(data)>50000:
+                      Path('greek.pdf').write_bytes(data); pdf=Path('greek.pdf'); used=u; break
+              except Exception:
+                  pass
+          if pdf is None:
+              report={'countryID':'gr','status':'SOURCE_DISCOVERY_FAILED','minimumRequired':300,'candidateCount':len(candidates)}
+              Path('out/gr-production-report.json').write_text(json.dumps(report,indent=2),encoding='utf-8')
+              print(json.dumps(report,indent=2))
+              raise SystemExit('Greek PDF could not be downloaded from discovered links')
+          subprocess.run(['pdftotext','-layout',str(pdf),'greek.txt'],check=True)
+          text=Path('greek.txt').read_text(encoding='utf-8',errors='ignore')
+          # Conservative numbered-entry segmentation; only long cooking segments count.
+          parts=re.split(r'(?m)^\s*(\d{1,4})[\.\)\-]\s+',text)
+          recipes=[]; seen=set(); seenfp=set(); rejected={'short':0,'non_recipe':0,'duplicate':0}
+          cook_re=re.compile(r'(βράζ|ψήν|τηγαν|κόβ|προσθέτ|αλάτι|πιπέρι|λάδι|βούτυρ|κρέας|ψάρ|αυγ|ζάχαρ|αλεύρ|ρύζ|κρεμμύδ)',re.I)
+          for i in range(1,len(parts)-1,2):
+              num=parts[i]; body=' '.join(parts[i+1].split())
+              if len(body)<100:
+                  rejected['short']+=1; continue
+              if not cook_re.search(body):
+                  rejected['non_recipe']+=1; continue
+              title=body[:80].split('.')[0].strip(' :-—')
+              if len(title)<3: title=f'Greek recipe {num}'
+              key=unicodedata.normalize('NFKC',title).casefold(); fp=hashlib.sha1(body.casefold().encode()).hexdigest()
+              if key in seen or fp in seenfp:
+                  rejected['duplicate']+=1; continue
+              seen.add(key); seenfp.add(fp)
+              recipes.append({'id':f'gr-{num}-{hashlib.sha1(title.encode()).hexdigest()[:8]}','countryID':'gr','name':title,'mealType':'main','description':'Source-grounded Greek historical recipe.','baseServings':0,'prepMinutes':0,'cookMinutes':0,'ingredients':[],'steps':[body],'tags':['gr','source-grounded','historical'],'provenance':{'sourceTitle':'Εγχειρίδιον Μαγειρικής','author':'Σταμάτιος Πλατύς','year':1883,'sourceURL':used,'license':'CC0 / Public Domain'}})
+          selected=recipes[:350]; status='PASS' if len(selected)>=300 else 'FAIL'
+          pack=Path('out/CulinaryRecipes-gr.json')
+          pack.write_text(json.dumps({'schemaVersion':1,'countryID':'gr','recipes':selected},ensure_ascii=False,separators=(',',':')),encoding='utf-8')
+          sha=hashlib.sha256(pack.read_bytes()).hexdigest()
+          report={'countryID':'gr','uniqueStandaloneRows':len(recipes),'shippedRows':len(selected),'minimumRequired':300,'status':status,'sha256':sha,'sourceURL':used,'rejected':rejected}
+          Path('out/gr-production-report.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
+          Path('out/CulinaryRecipes-gr.json.sha256').write_text(sha+'  CulinaryRecipes-gr.json\n')
+          print(json.dumps(report,ensure_ascii=False,indent=2))
+          if status!='PASS': raise SystemExit('Greece pack failed 300+ gate')
+
+      - name: Upload final-two production evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: remnis-culinary-greece-romania
+          path: |
+            out/
+            greek-source-candidates.txt
+          if-no-files-found: error
+          compression-level: 9
