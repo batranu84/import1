@@ -1,0 +1,75 @@
+name: REMNIS Culinary Publisher
+
+on:
+  push:
+    branches: [remnis-culinary-builder]
+    paths:
+      - '.github/workflows/remnis-culinary-publish.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: remnis-culinary-builder
+
+      - name: Download validated Italy artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/italy remnis-culinary/it
+          curl --fail --location \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/repos/batranu84/import1/actions/artifacts/10194004887/zip \
+            -o /tmp/italy.zip
+          unzip -q /tmp/italy.zip -d /tmp/italy
+          cp /tmp/italy/CulinaryRecipes-it.json remnis-culinary/it/
+          cp /tmp/italy/CulinaryRecipes-it.json.sha256 remnis-culinary/it/
+          cp /tmp/italy/italy-production-report.json remnis-culinary/it/
+
+      - name: Verify and create public catalogue manifest
+        shell: python
+        run: |
+          import hashlib, json
+          from pathlib import Path
+          pack=Path('remnis-culinary/it/CulinaryRecipes-it.json')
+          data=pack.read_bytes()
+          env=json.loads(data)
+          assert env['countryID']=='it'
+          assert len(env['recipes']) >= 300
+          digest=hashlib.sha256(data).hexdigest()
+          report=json.loads(Path('remnis-culinary/it/italy-production-report.json').read_text())
+          assert report['status']=='PASS'
+          assert report['sha256']==digest
+          manifest={
+            'schemaVersion':1,
+            'catalogVersion':1,
+            'minimumRecipesPerCuisine':300,
+            'indexFileID':None,
+            'indexSHA256':None,
+            'packs':[{
+              'countryID':'it',
+              'version':1,
+              'recipeCount':len(env['recipes']),
+              'fileID':None,
+              'downloadURL':'https://raw.githubusercontent.com/batranu84/import1/remnis-culinary-builder/remnis-culinary/it/CulinaryRecipes-it.json',
+              'sha256':digest
+            }]
+          }
+          Path('remnis-culinary/manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')
+          print(f"Publishing Italy: {len(env['recipes'])} recipes, sha256={digest}")
+
+      - name: Commit public catalogue
+        run: |
+          set -euo pipefail
+          git config user.name 'REMNIS Culinary Publisher'
+          git config user.email 'actions@users.noreply.github.com'
+          git add remnis-culinary
+          git commit -m 'Publish validated REMNIS Italy Culinary pack'
+          git push origin HEAD:remnis-culinary-builder
