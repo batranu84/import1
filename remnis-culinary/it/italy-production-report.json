@@ -1,0 +1,20 @@
+{
+  "countryID": "it",
+  "sourceURL": "italy-source.jsonl",
+  "rawRows": 829,
+  "licensedRows": 829,
+  "structurallyCompleteRows": 792,
+  "uniqueStandaloneRows": 768,
+  "shippedRows": 350,
+  "minimumRequired": 300,
+  "status": "PASS",
+  "sha256": "0a107c38e39f7397073ad2fa4e4e359f1d85f2a8877d61d33e6b02184a971863",
+  "rejected": {
+    "invalid_json": 0,
+    "wrong_culture": 0,
+    "license": 0,
+    "incomplete": 0,
+    "cross_reference": 37,
+    "duplicate": 24
+  }
+}

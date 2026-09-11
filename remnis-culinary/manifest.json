@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "catalogVersion": 1,
+  "minimumRecipesPerCuisine": 300,
+  "indexFileID": null,
+  "indexSHA256": null,
+  "packs": [
+    {
+      "countryID": "it",
+      "version": 1,
+      "recipeCount": 350,
+      "fileID": null,
+      "downloadURL": "https://raw.githubusercontent.com/batranu84/import1/remnis-culinary-builder/remnis-culinary/it/CulinaryRecipes-it.json",
+      "sha256": "0a107c38e39f7397073ad2fa4e4e359f1d85f2a8877d61d33e6b02184a971863"
+    }
+  ]
+}
