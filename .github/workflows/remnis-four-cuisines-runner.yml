@@ -1,0 +1,48 @@
+name: REMNIS Four Cuisine Production
+
+on:
+  push:
+    branches:
+      - remnis-culinary-production-20260911
+    paths:
+      - '.github/workflows/remnis-four-cuisines-runner.yml'
+      - 'remnis-culinary/runner2.tar.gz.b64'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  produce:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Decode runner
+        run: |
+          mkdir -p runner
+          base64 -d remnis-culinary/runner2.tar.gz.b64 > /tmp/runner.tar.gz
+          tar -xzf /tmp/runner.tar.gz -C runner
+          chmod +x runner/run_four.sh
+      - name: Produce four cuisine packs
+        run: ./runner/run_four.sh
+      - name: Show status
+        if: always()
+        run: |
+          cat runner/.culinary-wide-web/status.tsv || true
+          find runner/Features/Family/Culinary/RecipePacks -maxdepth 1 -type f -print || true
+      - name: Upload production evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: remnis-four-cuisines-production
+          if-no-files-found: warn
+          path: |
+            runner/Features/Family/Culinary/RecipePacks/CulinaryRecipes-*.json
+            runner/.culinary-wide-web/status.tsv
+            runner/.culinary-wide-web/*report*.json
+            runner/.culinary-wide-web/*rejected*.json
+            runner/.culinary-wide-web/*.jsonl
