@@ -1,0 +1,172 @@
+name: REMNIS Culinary China Source Build
+
+on:
+  push:
+    branches: [remnis-culinary-build119]
+  workflow_dispatch:
+
+jobs:
+  china:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Acquire reusable sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/worryzyy/HowToCook-mcp.git howtocook-mcp
+          git clone --depth 1 https://github.com/AdamBouhmad/open-recipe-archive.git open-recipe-archive
+          mkdir -p out/source out/normalized
+          cp howtocook-mcp/all_recipes.json out/source/howtocook-all-recipes.json
+          cp open-recipe-archive/collections/chinese-kitchen/recipes.jsonl out/source/open-recipe-archive-chinese-kitchen.jsonl
+          cp howtocook-mcp/README_EN.md out/source/howtocook-README_EN.md || true
+
+      - name: Normalize and hard-audit China candidates
+        shell: bash
+        run: |
+          cat > /tmp/build_china.py <<'PY'
+          import json,re,hashlib,pathlib,unicodedata
+          from collections import Counter
+
+          out=pathlib.Path('out')
+          UNIT_MAP={
+            'g':'g','kg':'kg','ml':'ml','l':'L','毫升':'ml','升':'L','克':'g','千克':'kg',
+            '个':'piece','颗':'piece','只':'piece','片':'piece','根':'piece','瓣':'clove','块':'piece',
+            '勺':'tbsp','汤匙':'tbsp','大勺':'tbsp','小勺':'tsp','茶匙':'tsp','杯':'cup','碗':'bowl',
+            '斤':'jin','两':'liang','包':'packet','袋':'packet','罐':'can','张':'piece','条':'piece','枚':'piece'
+          }
+          QTY=re.compile(r'(?P<amount>(?:\d+\s+)?\d+/\d+|\d+(?:\.\d+)?(?:\s*[-~至到]\s*\d+(?:\.\d+)?)?|[¼½¾⅓⅔⅛⅜⅝⅞])\s*(?P<unit>kg|g|ml|mL|l|L|毫升|升|克|千克|个|颗|只|片|根|瓣|块|勺|汤匙|大勺|小勺|茶匙|杯|碗|斤|两|包|袋|罐|张|条|枚)',re.I)
+          TIME=re.compile(r'(?P<n>\d+(?:\.\d+)?)\s*(?P<u>小时|小時|分钟|分鐘|分|秒|minutes?|mins?|hours?|hrs?|seconds?|secs?)',re.I)
+          FRAC={'¼':.25,'½':.5,'¾':.75,'⅓':1/3,'⅔':2/3,'⅛':.125,'⅜':.375,'⅝':.625,'⅞':.875}
+          def clean(x): return re.sub(r'\s+',' ',str(x or '')).strip()
+          def amount(tok):
+            tok=tok.strip()
+            if tok in FRAC:return FRAC[tok]
+            m=re.match(r'^(\d+(?:\.\d+)?)\s*[-~至到]\s*(\d+(?:\.\d+)?)$',tok)
+            if m:return (float(m.group(1))+float(m.group(2)))/2
+            m=re.match(r'^(\d+)\s+(\d+)/(\d+)$',tok)
+            if m and int(m.group(3)):return int(m.group(1))+int(m.group(2))/int(m.group(3))
+            m=re.match(r'^(\d+)/(\d+)$',tok)
+            if m and int(m.group(2)):return int(m.group(1))/int(m.group(2))
+            try:return float(tok)
+            except:return None
+          def ingredient(item):
+            if isinstance(item,dict):
+              raw=clean(item.get('text_quantity') or item.get('name'))
+              fallback=clean(item.get('name'))
+            else:
+              raw=clean(item); fallback=raw
+            raw=raw.lstrip('-*• ')
+            m=QTY.search(raw)
+            if not m:return None
+            a=amount(m.group('amount'))
+            if not a or a<=0:return None
+            u0=m.group('unit'); u=UNIT_MAP.get(u0.casefold(),UNIT_MAP.get(u0,u0))
+            name=fallback
+            # Prefer semantic text before quantity; aggregate names sometimes contain the whole quantified line.
+            if not name or QTY.search(name):
+              before=raw[:m.start()].strip(' ,，、:：')
+              after=raw[m.end():].strip(' ,，、:：*（）()')
+              name=before or after or fallback
+            name=clean(re.sub(r'^[-*•]\s*','',name)).strip(' ,，、:：')
+            if not name:return None
+            return {'name':name,'amount':a,'unit':u,'note':raw}
+          def canon(s):
+            s=unicodedata.normalize('NFKC',clean(s).casefold())
+            return re.sub(r'[\W_]+','',s)
+          def minutes(steps,r):
+            vals=[]
+            for k in ('prep_time_minutes','cook_time_minutes','total_time_minutes'):
+              try:
+                v=float(r.get(k) or 0)
+                if v>0: vals.append(v)
+              except:pass
+            if vals:return max(1,round(max(vals)))
+            sec=0.0
+            for s in steps:
+              for m in TIME.finditer(s):
+                n=float(m.group('n')); u=m.group('u').casefold()
+                if '小时' in u or '小時' in u or u.startswith(('hour','hr')):sec+=n*3600
+                elif '秒' in u or u.startswith(('second','sec')):sec+=n
+                else:sec+=n*60
+            return max(1,round(sec/60)) if sec else 0
+          def normalize_howtocook(r):
+            title=re.sub(r'(?:的)?做法$','',clean(r.get('name'))).strip()
+            if not title:return None,'title'
+            try:serv=int(r.get('servings') or 0)
+            except:serv=0
+            if serv<1:return None,'servings'
+            quantified=[]; seen=set()
+            for it in r.get('ingredients') or []:
+              q=ingredient(it)
+              if not q:continue
+              key=(canon(q['name']),round(q['amount'],6),q['unit'])
+              if key in seen:continue
+              seen.add(key);quantified.append(q)
+            if len(quantified)<4:return None,'quantities'
+            steps=[]
+            for s in r.get('steps') or []:
+              text=clean(s.get('description') if isinstance(s,dict) else s)
+              if len(text)>=8:steps.append(text)
+            if len(steps)<2:return None,'steps'
+            cook=minutes(steps,r)
+            if cook<1:return None,'time'
+            source_path=clean(r.get('source_path'))
+            return {
+              'countryID':'cn','title':title,'description':clean(r.get('description'))[:800],
+              'servings':serv,'prepMinutes':0,'cookMinutes':cook,'ingredients':quantified,'steps':steps,
+              'mealType':'main','tags':['china','howtocook','source-grounded'],
+              'sourceTitle':'HowToCook','sourceURL':('https://github.com/Anduin2017/HowToCook/blob/master/'+source_path if source_path else 'https://github.com/Anduin2017/HowToCook'),
+              'sourceYear':2026,'author':'HowToCook contributors','license':'unlicense'
+            },None
+
+          src=json.loads((out/'source/howtocook-all-recipes.json').read_text(encoding='utf-8'))
+          if isinstance(src,dict):src=src.get('recipes') or src.get('items') or []
+          valid=[];reject=Counter();names=set()
+          for r in src:
+            if not isinstance(r,dict):continue
+            row,why=normalize_howtocook(r)
+            if not row:reject[why]+=1;continue
+            k=canon(row['title'])
+            if k in names:reject['duplicate_title']+=1;continue
+            names.add(k);valid.append(row)
+          with (out/'normalized/howtocook-production-candidates.jsonl').open('w',encoding='utf-8') as f:
+            for r in valid:f.write(json.dumps(r,ensure_ascii=False)+'\n')
+
+          # Preserve the public-domain archive source and count it separately. Do not promote
+          # rows from this source unless their own servings/timing/quantity evidence is complete.
+          ora_raw=0;ora_china=0
+          for line in (out/'source/open-recipe-archive-chinese-kitchen.jsonl').read_text(encoding='utf-8').splitlines():
+            try:o=json.loads(line)
+            except:continue
+            ora_raw+=1
+            if str(o.get('culture','')).casefold()=='china' and str(o.get('license','')).casefold() in {'public-domain','public domain','cc0','unlicense'}:ora_china+=1
+
+          report={
+            'sourceCommit': 'Anduin2017/HowToCook current master via worryzyy/HowToCook-mcp aggregate',
+            'howToCookRawRecipes':len(src),
+            'howToCookProductionCandidates':len(valid),
+            'howToCookRejected':dict(reject),
+            'openRecipeArchiveRawRows':ora_raw,
+            'openRecipeArchiveReusableChinaRows':ora_china,
+            'minimumRequired':300,
+            'status':'PASS_SOURCE_CAPACITY' if len(valid)>=300 else 'NEEDS_SUPPLEMENT',
+            'policy':'No synthetic recipes, quantities, servings, or timing. Candidate means >=4 source-quantified ingredients, source servings, >=2 meaningful steps, and source timing evidence.'
+          }
+          (out/'CHINA_SOURCE_AUDIT.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
+          print(json.dumps(report,ensure_ascii=False,indent=2))
+          PY
+          python /tmp/build_china.py
+
+      - name: Package source evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd out && sha256sum source/* normalized/* CHINA_SOURCE_AUDIT.json > SHA256SUMS.txt)
+
+      - name: Upload China source bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: remnis-china-source-build119
+          path: out/
+          retention-days: 7
