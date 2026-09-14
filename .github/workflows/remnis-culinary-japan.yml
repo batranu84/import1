@@ -24,91 +24,71 @@ jobs:
         shell: bash
         run: |
           cat > /tmp/japan_audit.py <<'PY'
-          import json,re,pathlib,time
+          import json,re,pathlib,unicodedata
           import requests
-          from bs4 import BeautifulSoup
 
           out=pathlib.Path('out')
-          report={
-            'countryID':'jp',
-            'minimumRequired':300,
-            'policy':'Only source-grounded recipes from public-domain or explicit commercial-compatible Creative Commons sources. No relabelling of other cuisines and no synthetic recipe variants.'
-          }
+          report={'countryID':'jp','minimumRequired':300,'policy':'Only source-grounded recipes from public-domain or explicit commercial-compatible Creative Commons sources. No relabelling of other cuisines and no synthetic recipe variants.'}
           s=requests.Session(); s.headers['User-Agent']='REMNIS-One-source-audit/1.0 (+https://proartlabs.com/remnis-one/)'
+          def canon(v):
+            v=unicodedata.normalize('NFKC',str(v or '')).casefold()
+            return re.sub(r'[^0-9a-z\u3040-\u30ff\u3400-\u9fff]+','',v)
 
-          ora=pathlib.Path('open-recipe-archive/collections/japanese-kitchen/recipes.jsonl')
-          ora_rows=[]
-          if ora.exists():
-            for line in ora.read_text(encoding='utf-8').splitlines():
+          # Scan every Open Recipe Archive collection, not only japanese-kitchen.
+          ora=[]; seen=set(); by_collection={}
+          for p in pathlib.Path('open-recipe-archive/collections').glob('*/recipes.jsonl'):
+            local=0
+            for line in p.read_text(encoding='utf-8',errors='ignore').splitlines():
               try:r=json.loads(line)
               except:continue
-              if str(r.get('culture','')).casefold()=='japan' and str(r.get('license','')).casefold() in {'public-domain','public domain','cc0','unlicense'}:
-                ora_rows.append(r)
-          report['openRecipeArchive']={'usableRows':len(ora_rows),'license':'public-domain','source':'AdamBouhmad/open-recipe-archive japanese-kitchen'}
-          with (out/'source/open-recipe-archive-japan.jsonl').open('w',encoding='utf-8') as f:
-            for r in ora_rows:f.write(json.dumps(r,ensure_ascii=False)+'\n')
+              if str(r.get('culture','')).casefold()!='japan':continue
+              if str(r.get('license','')).casefold() not in {'public-domain','public domain','cc0','unlicense'}:continue
+              k=canon(r.get('title'))
+              if not k or k in seen:continue
+              seen.add(k); ora.append(r); local+=1
+            if local:by_collection[p.parent.name]=local
+          report['openRecipeArchive']={'usableDistinctRows':len(ora),'license':'public-domain/CC0/Unlicense','collections':by_collection,'source':'AdamBouhmad/open-recipe-archive all collections'}
+          with (out/'source/open-recipe-archive-japan-all.jsonl').open('w',encoding='utf-8') as f:
+            for r in ora:f.write(json.dumps(r,ensure_ascii=False)+'\n')
 
-          fr=[]
+          fr=[]; seen_fr=set()
           for p in pathlib.Path('forkrecipe-recipes/recipes').glob('*.js'):
             t=p.read_text(encoding='utf-8',errors='ignore')
             cuisine=re.search(r'\bcuisine:\s*["\']([^"\']+)["\']',t)
             culture=re.search(r'\bculture:\s*["\']([^"\']+)["\']',t)
             lic=re.search(r'\blicense:\s*["\']([^"\']+)["\']',t)
+            title=re.search(r'\btitle:\s*["\']([^"\']+)["\']',t)
             is_jp=(cuisine and 'japan' in cuisine.group(1).casefold()) or (culture and 'japan' in culture.group(1).casefold())
-            if is_jp and lic and 'cc-by-sa' in lic.group(1).casefold():
-              fr.append({'path':str(p.relative_to('forkrecipe-recipes')),'cuisine':cuisine.group(1) if cuisine else None,'culture':culture.group(1) if culture else None,'license':lic.group(1)})
-          report['forkRecipe']={'usableRows':len(fr),'license':'CC BY-SA','source':'futurechef/forkrecipe-recipes'}
+            if not (is_jp and lic and 'cc-by-sa' in lic.group(1).casefold()):continue
+            k=canon(title.group(1) if title else p.stem)
+            if not k or k in seen_fr:continue
+            seen_fr.add(k)
+            fr.append({'path':str(p.relative_to('forkrecipe-recipes')),'title':title.group(1) if title else p.stem,'cuisine':cuisine.group(1) if cuisine else None,'culture':culture.group(1) if culture else None,'license':lic.group(1)})
+          report['forkRecipe']={'usableDistinctRows':len(fr),'license':'CC BY-SA','source':'futurechef/forkrecipe-recipes'}
           (out/'source/forkrecipe-japan-index.json').write_text(json.dumps(fr,ensure_ascii=False,indent=2),encoding='utf-8')
 
-          api='https://en.wikibooks.org/w/api.php'
-          cm=[]; cont={}
+          api='https://en.wikibooks.org/w/api.php'; cm=[]; cont={}
           while True:
-            params={'action':'query','format':'json','list':'categorymembers','cmtitle':'Category:Japanese recipes','cmlimit':'500','cmnamespace':'102'}
-            params.update(cont)
+            params={'action':'query','format':'json','list':'categorymembers','cmtitle':'Category:Japanese recipes','cmlimit':'500','cmnamespace':'102'}; params.update(cont)
             data=s.get(api,params=params,timeout=30).json(); cm.extend(data.get('query',{}).get('categorymembers',[]))
             if 'continue' not in data:break
             cont=data['continue']
-          report['wikibooks']={'categoryRows':len(cm),'license':'CC BY-SA','source':'Wikibooks Category:Japanese recipes'}
-          (out/'source/wikibooks-japanese-index.json').write_text(json.dumps(cm,ensure_ascii=False,indent=2),encoding='utf-8')
+          cm_unique=[]; seen_w=set()
+          for x in cm:
+            k=canon(x.get('title'))
+            if not k or k in seen_w:continue
+            seen_w.add(k); cm_unique.append(x)
+          report['wikibooks']={'categoryDistinctRows':len(cm_unique),'license':'CC BY-SA','source':'Wikibooks Category:Japanese recipes'}
+          (out/'source/wikibooks-japanese-index.json').write_text(json.dumps(cm_unique,ensure_ascii=False,indent=2),encoding='utf-8')
 
-          # Public Japanese recipe translations at jaygerbrandt.com/tofu/.
-          # This audit does not assume rights from title alone: it records only pages that
-          # explicitly expose a Creative Commons attribution/share-alike notice in page text.
-          tofu=[]
-          base='https://jaygerbrandt.com/tofu/'
-          try:
-            home=s.get(base,timeout=30); home.raise_for_status(); soup=BeautifulSoup(home.text,'html.parser')
-            links=[]
-            for a in soup.find_all('a',href=True):
-              href=a['href']
-              if href.startswith('/'):
-                href='https://jaygerbrandt.com'+href
-              elif href.startswith('./'):
-                href=base+href[2:]
-              elif not href.startswith('http'):
-                href=base+href
-              if 'jaygerbrandt.com/tofu/' in href and href.rstrip('/')!=base.rstrip('/'):
-                links.append(href.split('#')[0])
-            links=sorted(set(links))
-            for url in links:
-              try:
-                r=s.get(url,timeout=20); r.raise_for_status(); ps=BeautifulSoup(r.text,'html.parser'); txt=ps.get_text('\n',strip=True)
-              except:continue
-              low=txt.casefold()
-              licensed=('creative commons' in low and ('sharealike' in low or 'cc by-sa' in low or 'attribution-sharealike' in low))
-              # recipe-like: a numbered heading/title plus preparation prose
-              h=(ps.find('h1') or ps.find('h2'))
-              if licensed and h and len(txt)>250:
-                tofu.append({'url':url,'title':h.get_text(' ',strip=True),'licenseEvidence':'Creative Commons attribution/share-alike notice present'})
-              time.sleep(.03)
-          except Exception as e:
-            report['tofuHyakuchinError']=str(e)[:200]
-          report['tofuHyakuchinWeb']={'licensedRecipePages':len(tofu),'source':'jaygerbrandt.com/tofu/'}
-          (out/'source/tofu-hyakuchin-index.json').write_text(json.dumps(tofu,ensure_ascii=False,indent=2),encoding='utf-8')
-
-          conservative=len(ora_rows)+len(fr)+len(cm)+len(tofu)
-          report['conservativeLicensedCapacity']=conservative
-          report['status']='PASS_CAPACITY' if conservative>=300 else 'NEEDS_MORE_LICENSED_SOURCES'
+          # Cross-source title dedupe for conservative capacity.
+          merged={}
+          for r in ora: merged.setdefault(canon(r.get('title')),('ora',r.get('title')))
+          for r in fr: merged.setdefault(canon(r.get('title')),('forkrecipe',r.get('title')))
+          for r in cm_unique: merged.setdefault(canon(r.get('title')),('wikibooks',r.get('title')))
+          report['crossSourceDistinctLicensedCapacity']=len(merged)
+          report['remainingTo300']=max(0,300-len(merged))
+          report['status']='PASS_CAPACITY' if len(merged)>=300 else 'NEEDS_MORE_LICENSED_SOURCES'
           (out/'JAPAN_SOURCE_CAPACITY_AUDIT.json').write_text(json.dumps(report,ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
           print(json.dumps(report,ensure_ascii=False,indent=2))
           PY
@@ -118,6 +98,6 @@ jobs:
       - name: Upload Japan capacity audit
         uses: actions/upload-artifact@v4
         with:
-          name: remnis-japan-capacity-audit-build121b
+          name: remnis-japan-capacity-audit-build121c
           path: out/
           retention-days: 7
