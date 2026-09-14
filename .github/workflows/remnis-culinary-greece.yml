@@ -27,46 +27,34 @@ jobs:
           import requests
           from bs4 import BeautifulSoup
 
-          out=pathlib.Path('out')
-          MIN=200
+          out=pathlib.Path('out'); MIN=200
           s=requests.Session(); s.headers['User-Agent']='REMNIS-One-source-audit/1.0 (+https://proartlabs.com/remnis-one/)'
-
           def clean(x): return re.sub(r'\s+',' ',str(x or '')).strip()
           def canon(x):
             x=unicodedata.normalize('NFKC',clean(x).casefold())
             return re.sub(r'[^0-9a-z\u0370-\u03ff]+','',x)
-          qty_re=re.compile(r'(?i)(?:\b\d+(?:\.\d+)?(?:\s*[-–]\s*\d+(?:\.\d+)?)?\b|\b(?:one|two|three|four|five|six|seven|eight|nine|ten|half|quarter|third)\b)\s*(?:g|kg|ml|l|cup|cups|tbsp|tablespoons?|tsp|teaspoons?|oz|ounces?|lb|pounds?|cloves?|pieces?|cans?|bunch(?:es)?|pinch(?:es)?|slice(?:s)?)\b')
-
+          qty_re=re.compile(r'(?i)(?:\b\d+(?:\.\d+)?(?:\s*[-–]\s*\d+(?:\.\d+)?)?\b|\b(?:one|two|three|four|five|six|seven|eight|nine|ten|half|quarter|third)\b)\s*(?:g|kg|ml|l|cup|cups|tbsp|tablespoons?|tsp|teaspoons?|oz|ounces?|lb|pounds?|cloves?|pieces?|cans?|bunch(?:es)?|pinch(?:es)?|slice(?:s)?|quart(?:s)?|pint(?:s)?|teacup(?:ful)?s?|dessertspoon(?:ful)?s?)\b')
           candidates=[]; seen=set(); stats={}
-          def add(title,ingredients,steps,source,license_,url,raw=None):
+          def add(title,ingredients,steps,source,license_,url):
             title=clean(title); ingredients=[clean(x) for x in ingredients if clean(x)]; steps=[clean(x) for x in steps if len(clean(x))>=8]
             if not title or len(steps)<2 or len(ingredients)<4:return False
             quantified=sum(1 for x in ingredients if qty_re.search(x))
             if quantified<3:return False
             k=canon(title)
             if not k or k in seen:return False
-            seen.add(k)
-            candidates.append({'countryID':'gr','title':title,'ingredientsText':ingredients,'steps':steps,'source':source,'license':license_,'sourceURL':url,'quantifiedIngredientLines':quantified})
-            return True
+            seen.add(k); candidates.append({'countryID':'gr','title':title,'ingredientsText':ingredients,'steps':steps,'source':source,'license':license_,'sourceURL':url,'quantifiedIngredientLines':quantified}); return True
 
-          # ForkRecipe: explicit CC-BY-SA Greek cuisine recipes.
           fr=0
           for p in pathlib.Path('forkrecipe-recipes/recipes').glob('*.js'):
             t=p.read_text(encoding='utf-8',errors='ignore')
-            cuisine=re.search(r'\bcuisine:\s*["\']([^"\']+)["\']',t)
-            culture=re.search(r'\bculture:\s*["\']([^"\']+)["\']',t)
-            lic=re.search(r'\blicense:\s*["\']([^"\']+)["\']',t)
-            title=re.search(r'\btitle:\s*["\']([^"\']+)["\']',t)
+            cuisine=re.search(r'\bcuisine:\s*["\']([^"\']+)["\']',t); culture=re.search(r'\bculture:\s*["\']([^"\']+)["\']',t); lic=re.search(r'\blicense:\s*["\']([^"\']+)["\']',t); title=re.search(r'\btitle:\s*["\']([^"\']+)["\']',t)
             is_gr=(cuisine and 'greek' in cuisine.group(1).casefold()) or (culture and 'greek' in culture.group(1).casefold())
             if not (is_gr and lic and 'cc-by-sa' in lic.group(1).casefold() and title): continue
-            ings=[]
-            for m in re.finditer(r'name:\s*["\']([^"\']+)["\'][^\n]*?ratioValue:\s*([0-9.]+)[^\n]*?defaultUnit:\s*["\']([^"\']+)["\']',t):
-              ings.append(f'{m.group(2)} {m.group(3)} {m.group(1)}')
+            ings=[f'{m.group(2)} {m.group(3)} {m.group(1)}' for m in re.finditer(r'name:\s*["\']([^"\']+)["\'][^\n]*?ratioValue:\s*([0-9.]+)[^\n]*?defaultUnit:\s*["\']([^"\']+)["\']',t)]
             steps=[m.group(1) for m in re.finditer(r'instructions:\s*["\']([^"\']{8,})["\']',t)]
-            if add(title.group(1),ings,steps,'futurechef/forkrecipe-recipes','CC BY-SA',f'https://github.com/futurechef/forkrecipe-recipes/blob/main/{p.relative_to("forkrecipe-recipes")}',t):fr+=1
+            if add(title.group(1),ings,steps,'futurechef/forkrecipe-recipes','CC BY-SA',f'https://github.com/futurechef/forkrecipe-recipes/blob/main/{p.relative_to("forkrecipe-recipes")}'):fr+=1
           stats['forkRecipeAccepted']=fr
 
-          # Wikibooks Greek recipes (CC BY-SA). Fetch each category page and parse recipe prose.
           api='https://en.wikibooks.org/w/api.php'; members=[]; cont={}
           while True:
             params={'action':'query','format':'json','list':'categorymembers','cmtitle':'Category:Greek recipes','cmlimit':'500','cmnamespace':'0|102'}; params.update(cont)
@@ -77,64 +65,85 @@ jobs:
           for m in members:
             title=m.get('title');
             if not title:continue
-            data=s.get(api,params={'action':'parse','format':'json','page':title,'prop':'text'},timeout=30).json()
-            html=data.get('parse',{}).get('text',{}).get('*','')
+            data=s.get(api,params={'action':'parse','format':'json','page':title,'prop':'text'},timeout=30).json(); html=data.get('parse',{}).get('text',{}).get('*','')
             if not html:continue
-            soup=BeautifulSoup(html,'html.parser')
-            txt=soup.get_text('\n',strip=True)
-            ings=[]; steps=[]
+            soup=BeautifulSoup(html,'html.parser'); ings=[]; steps=[]
             for h in soup.find_all(['h2','h3','h4']):
-              label=h.get_text(' ',strip=True).casefold()
-              items=[]
-              node=h.find_next_sibling()
+              label=h.get_text(' ',strip=True).casefold(); items=[]; node=h.find_next_sibling()
               while node and node.name not in ['h2','h3','h4']:
-                if node.name in ['ul','ol']:
-                  items += [li.get_text(' ',strip=True) for li in node.find_all('li',recursive=False)]
-                elif node.name=='p' and len(node.get_text(' ',strip=True))>20:
-                  items.append(node.get_text(' ',strip=True))
+                if node.name in ['ul','ol']: items += [li.get_text(' ',strip=True) for li in node.find_all('li',recursive=False)]
+                elif node.name=='p' and len(node.get_text(' ',strip=True))>20: items.append(node.get_text(' ',strip=True))
                 node=node.find_next_sibling()
               if 'ingredient' in label:ings+=items
               if any(k in label for k in ['procedure','direction','method','preparation']):steps+=items
             if add(title.split(':')[-1],ings,steps,'Wikibooks Greek recipes','CC BY-SA','https://en.wikibooks.org/wiki/'+title.replace(' ','_')):wiki_ok+=1
-            time.sleep(.03)
           stats['wikibooksCategoryRows']=len(members); stats['wikibooksAccepted']=wiki_ok
 
-          # Recipes Wiki/Fandom Greek recipes. Fandom community content is CC BY-SA; accept only pages
-          # where the article itself exposes identifiable ingredients and preparation text.
-          fapi='https://recipes.fandom.com/api.php'; fm=[]; cont={}
+          fapi='https://recipes.fandom.com/api.php'; fm=[]
           for cat in ['Category:Greek_Recipes','Category:Greek_recipes','Category:Greek_cuisine']:
-            local=[]; c={}
+            c={}
             while True:
               params={'action':'query','format':'json','list':'categorymembers','cmtitle':cat,'cmlimit':'500','cmnamespace':'0'}; params.update(c)
               try:data=s.get(fapi,params=params,timeout=30).json()
               except:break
-              local.extend(data.get('query',{}).get('categorymembers',[]))
+              fm.extend(data.get('query',{}).get('categorymembers',[]))
               if 'continue' not in data:break
               c=data['continue']
-            fm.extend(local)
-          unique={m.get('pageid'):m for m in fm if m.get('pageid')}.values(); fandom_ok=0
-          for m in unique:
+          unique={m.get('pageid'):m for m in fm if m.get('pageid')}; fandom_ok=0
+          for m in unique.values():
             title=m.get('title'); pageid=m.get('pageid')
             try:data=s.get(fapi,params={'action':'parse','format':'json','pageid':pageid,'prop':'text'},timeout=30).json()
             except:continue
             html=data.get('parse',{}).get('text',{}).get('*','')
             if not html:continue
-            soup=BeautifulSoup(html,'html.parser')
-            ings=[]; steps=[]
+            soup=BeautifulSoup(html,'html.parser'); ings=[]; steps=[]
             for h in soup.find_all(['h2','h3','h4']):
-              label=h.get_text(' ',strip=True).casefold()
-              items=[]; node=h.find_next_sibling()
+              label=h.get_text(' ',strip=True).casefold(); items=[]; node=h.find_next_sibling()
               while node and node.name not in ['h2','h3','h4']:
-                if node.name in ['ul','ol']:
-                  items += [li.get_text(' ',strip=True) for li in node.find_all('li',recursive=False)]
+                if node.name in ['ul','ol']:items += [li.get_text(' ',strip=True) for li in node.find_all('li',recursive=False)]
                 elif node.name=='p' and len(node.get_text(' ',strip=True))>20:items.append(node.get_text(' ',strip=True))
                 node=node.find_next_sibling()
               if 'ingredient' in label:ings+=items
               if any(k in label for k in ['direction','procedure','method','preparation']):steps+=items
-            url='https://recipes.fandom.com/wiki/'+title.replace(' ','_')
-            if add(title,ings,steps,'Recipes Wiki / Fandom','CC BY-SA',url):fandom_ok+=1
-            time.sleep(.02)
-          stats['fandomUniqueCategoryRows']=len(list(unique)); stats['fandomAccepted']=fandom_ok
+            if add(title,ings,steps,'Recipes Wiki / Fandom','CC BY-SA','https://recipes.fandom.com/wiki/'+title.replace(' ','_')):fandom_ok+=1
+          stats['fandomUniqueCategoryRows']=len(unique); stats['fandomAccepted']=fandom_ok
+
+          # Internet Archive public-domain cookbooks. Search only pre-1931 English-language books
+          # explicitly about Greek/Grecian cookery, then parse OCR recipe blocks. This is a
+          # supplement, not filler: only blocks with quantified ingredient evidence and method prose pass.
+          iaq='(title:(Greek cookery) OR title:(Greek cooking) OR title:(Grecian cookery) OR subject:(Greek cooking)) AND year:[1800 TO 1930] AND mediatype:texts'
+          try:
+            sr=s.get('https://archive.org/advancedsearch.php',params={'q':iaq,'fl[]':['identifier','title','year'],'rows':100,'page':1,'output':'json'},timeout=30).json()
+            docs=sr.get('response',{}).get('docs',[])
+          except Exception:
+            docs=[]
+          ia_ok=0; ia_books=0
+          heading_re=re.compile(r'(?m)^\s*(?:RECIPE\s+\d+[.: -]*)?([A-Z][A-Z0-9 ,\-\'()]{5,70})\s*$')
+          for d in docs:
+            ident=d.get('identifier');
+            if not ident:continue
+            try:meta=s.get(f'https://archive.org/metadata/{ident}',timeout=30).json()
+            except:continue
+            files=meta.get('files',[]); names=[f.get('name','') for f in files]
+            txtname=next((n for n in names if n.endswith('_djvu.txt')),None) or next((n for n in names if n.endswith('.txt') and 'searchtext' not in n),None)
+            if not txtname:continue
+            try:r=s.get(f'https://archive.org/download/{ident}/{txtname}',timeout=30); r.raise_for_status(); text=r.text
+            except:continue
+            if len(text)<5000:continue
+            ia_books+=1
+            matches=list(heading_re.finditer(text))
+            for i,m in enumerate(matches):
+              title=clean(m.group(1).title()); block=text[m.end():(matches[i+1].start() if i+1<len(matches) else min(len(text),m.end()+5000))]
+              if len(block)<120 or len(block)>7000:continue
+              lines=[clean(x) for x in block.splitlines() if clean(x)]
+              ing=[x for x in lines[:30] if qty_re.search(x)]
+              prose=[x for x in lines if len(x)>35 and not qty_re.search(x)]
+              if len(ing)<3 or not prose:continue
+              # Split long preparation prose into sentence-sized steps without inventing content.
+              steptext=' '.join(prose[:8]); steps=[clean(x) for x in re.split(r'(?<=[.!?])\s+',steptext) if len(clean(x))>=20][:10]
+              if len(steps)<2:continue
+              if add(title,ing,steps,'Internet Archive public-domain Greek/Grecian cookbook','public-domain',f'https://archive.org/details/{ident}'):ia_ok+=1
+          stats['internetArchiveBooksParsed']=ia_books; stats['internetArchiveAccepted']=ia_ok
 
           report={'countryID':'gr','minimumRequired':MIN,'acceptedDistinctCandidates':len(candidates),'sourceStats':stats,'status':'PASS_CAPACITY' if len(candidates)>=MIN else 'BELOW_200','policy':'200+ genuine source-grounded recipes accepted. No synthetic filler; minimum 4 ingredient lines, 3 quantified lines and 2 preparation steps.'}
           (out/'GREECE_SOURCE_AUDIT.json').write_text(json.dumps(report,ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
@@ -148,6 +157,6 @@ jobs:
       - name: Upload Greece audit
         uses: actions/upload-artifact@v4
         with:
-          name: remnis-greece-audit-build121
+          name: remnis-greece-audit-build121b
           path: out/
           retention-days: 7
