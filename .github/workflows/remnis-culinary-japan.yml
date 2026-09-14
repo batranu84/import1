@@ -34,8 +34,8 @@ jobs:
             'minimumRequired':300,
             'policy':'Only source-grounded recipes from public-domain or explicit commercial-compatible Creative Commons sources. No relabelling of other cuisines and no synthetic recipe variants.'
           }
+          s=requests.Session(); s.headers['User-Agent']='REMNIS-One-source-audit/1.0 (+https://proartlabs.com/remnis-one/)'
 
-          # 1) Open Recipe Archive: public-domain Japan corpus.
           ora=pathlib.Path('open-recipe-archive/collections/japanese-kitchen/recipes.jsonl')
           ora_rows=[]
           if ora.exists():
@@ -48,7 +48,6 @@ jobs:
           with (out/'source/open-recipe-archive-japan.jsonl').open('w',encoding='utf-8') as f:
             for r in ora_rows:f.write(json.dumps(r,ensure_ascii=False)+'\n')
 
-          # 2) ForkRecipe: explicit CC BY-SA recipes tagged/categorised Japanese.
           fr=[]
           for p in pathlib.Path('forkrecipe-recipes/recipes').glob('*.js'):
             t=p.read_text(encoding='utf-8',errors='ignore')
@@ -61,48 +60,55 @@ jobs:
           report['forkRecipe']={'usableRows':len(fr),'license':'CC BY-SA','source':'futurechef/forkrecipe-recipes'}
           (out/'source/forkrecipe-japan-index.json').write_text(json.dumps(fr,ensure_ascii=False,indent=2),encoding='utf-8')
 
-          # 3) CODH Tamago Hyakuchin. Dataset is CC BY-SA 4.0. We distinguish
-          # pages with modern recipe quantities from pages that only have transcription.
-          s=requests.Session(); s.headers['User-Agent']='REMNIS-One-source-audit/1.0 (+https://proartlabs.com/remnis-one/)'
-          tamago=[]; modern=0; transcription=0
-          for i in range(1,101):
-            url=f'https://codh.rois.ac.jp/edo-cooking/tamago-hyakuchin/recipe/{i:03d}.html.ja'
-            try:
-              rr=s.get(url,timeout=20); rr.raise_for_status()
-            except Exception as e:
-              tamago.append({'id':i,'url':url,'ok':False,'error':str(e)[:160]}); continue
-            soup=BeautifulSoup(rr.text,'html.parser')
-            txt=soup.get_text('\n',strip=True)
-            title=(soup.find('h2') or soup.find('h1'))
-            has_modern='現代レシピ' in txt and '分量' in txt
-            has_trans=('翻刻テキスト' in txt and '手順' in txt)
-            modern += int(has_modern); transcription += int(has_trans)
-            tamago.append({'id':i,'url':url,'ok':True,'title':title.get_text(' ',strip=True) if title else None,'modernRecipe':has_modern,'transcription':has_trans})
-            time.sleep(.05)
-          report['tamagoHyakuchin']={'pages':sum(1 for x in tamago if x['ok']),'modernRecipePages':modern,'transcriptionPages':transcription,'license':'CC BY-SA 4.0','source':'ROIS-DS CODH Edo Cooking Dataset'}
-          (out/'source/tamago-hyakuchin-index.json').write_text(json.dumps(tamago,ensure_ascii=False,indent=2),encoding='utf-8')
-
-          # 4) Wikibooks Japanese recipe category. Wikibooks text is CC BY-SA.
           api='https://en.wikibooks.org/w/api.php'
           cm=[]; cont={}
           while True:
             params={'action':'query','format':'json','list':'categorymembers','cmtitle':'Category:Japanese recipes','cmlimit':'500','cmnamespace':'102'}
             params.update(cont)
-            data=s.get(api,params=params,timeout=30).json()
-            cm.extend(data.get('query',{}).get('categorymembers',[]))
+            data=s.get(api,params=params,timeout=30).json(); cm.extend(data.get('query',{}).get('categorymembers',[]))
             if 'continue' not in data:break
             cont=data['continue']
           report['wikibooks']={'categoryRows':len(cm),'license':'CC BY-SA','source':'Wikibooks Category:Japanese recipes'}
           (out/'source/wikibooks-japanese-index.json').write_text(json.dumps(cm,ensure_ascii=False,indent=2),encoding='utf-8')
 
-          # Capacity count is deliberately conservative: Tamago pages are counted only
-          # when a modern recipe is present. Transcription-only pages require a separate
-          # source-faithful normalisation pass rather than fabricated quantities.
-          conservative = len(ora_rows)+len(fr)+modern+len(cm)
-          potential = len(ora_rows)+len(fr)+transcription+len(cm)
+          # Public Japanese recipe translations at jaygerbrandt.com/tofu/.
+          # This audit does not assume rights from title alone: it records only pages that
+          # explicitly expose a Creative Commons attribution/share-alike notice in page text.
+          tofu=[]
+          base='https://jaygerbrandt.com/tofu/'
+          try:
+            home=s.get(base,timeout=30); home.raise_for_status(); soup=BeautifulSoup(home.text,'html.parser')
+            links=[]
+            for a in soup.find_all('a',href=True):
+              href=a['href']
+              if href.startswith('/'):
+                href='https://jaygerbrandt.com'+href
+              elif href.startswith('./'):
+                href=base+href[2:]
+              elif not href.startswith('http'):
+                href=base+href
+              if 'jaygerbrandt.com/tofu/' in href and href.rstrip('/')!=base.rstrip('/'):
+                links.append(href.split('#')[0])
+            links=sorted(set(links))
+            for url in links:
+              try:
+                r=s.get(url,timeout=20); r.raise_for_status(); ps=BeautifulSoup(r.text,'html.parser'); txt=ps.get_text('\n',strip=True)
+              except:continue
+              low=txt.casefold()
+              licensed=('creative commons' in low and ('sharealike' in low or 'cc by-sa' in low or 'attribution-sharealike' in low))
+              # recipe-like: a numbered heading/title plus preparation prose
+              h=(ps.find('h1') or ps.find('h2'))
+              if licensed and h and len(txt)>250:
+                tofu.append({'url':url,'title':h.get_text(' ',strip=True),'licenseEvidence':'Creative Commons attribution/share-alike notice present'})
+              time.sleep(.03)
+          except Exception as e:
+            report['tofuHyakuchinError']=str(e)[:200]
+          report['tofuHyakuchinWeb']={'licensedRecipePages':len(tofu),'source':'jaygerbrandt.com/tofu/'}
+          (out/'source/tofu-hyakuchin-index.json').write_text(json.dumps(tofu,ensure_ascii=False,indent=2),encoding='utf-8')
+
+          conservative=len(ora_rows)+len(fr)+len(cm)+len(tofu)
           report['conservativeLicensedCapacity']=conservative
-          report['potentialLicensedCapacityAfterHistoricalNormalization']=potential
-          report['status']='PASS_CAPACITY' if conservative>=300 else ('PASS_AFTER_HISTORICAL_NORMALIZATION' if potential>=300 else 'NEEDS_MORE_LICENSED_SOURCES')
+          report['status']='PASS_CAPACITY' if conservative>=300 else 'NEEDS_MORE_LICENSED_SOURCES'
           (out/'JAPAN_SOURCE_CAPACITY_AUDIT.json').write_text(json.dumps(report,ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
           print(json.dumps(report,ensure_ascii=False,indent=2))
           PY
@@ -112,6 +118,6 @@ jobs:
       - name: Upload Japan capacity audit
         uses: actions/upload-artifact@v4
         with:
-          name: remnis-japan-capacity-audit-build121
+          name: remnis-japan-capacity-audit-build121b
           path: out/
           retention-days: 7
