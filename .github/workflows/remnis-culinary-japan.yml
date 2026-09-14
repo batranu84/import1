@@ -1,4 +1,4 @@
-name: REMNIS Culinary Japan Source Build
+name: REMNIS Culinary Japan Production Source Audit
 
 on:
   push:
@@ -11,34 +11,107 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - name: Acquire Japan workbook
+      - name: Acquire licensed Japan sources
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p out/source
-          curl -L --fail --retry 3 -o out/source/Asia_recipes_processed_ali.xlsx https://raw.githubusercontent.com/LiqiaoHuang/Asia_recipe_data/main/Asia_recipes_processed_ali.xlsx
-          python -m pip install --quiet openpyxl
-      - name: Inspect workbook schema
+          mkdir -p out/source out/audit
+          git clone --depth 1 https://github.com/AdamBouhmad/open-recipe-archive.git open-recipe-archive
+          git clone --depth 1 https://github.com/futurechef/forkrecipe-recipes.git forkrecipe-recipes
+          python -m pip install --quiet requests beautifulsoup4
+
+      - name: Audit source capacity and provenance
         shell: bash
         run: |
-          python - <<'PY'
-          import json
-          from openpyxl import load_workbook
-          p='out/source/Asia_recipes_processed_ali.xlsx'
-          wb=load_workbook(p,read_only=True,data_only=True)
-          report={'sheets':[]}
-          for ws in wb.worksheets:
-              rows=[]
-              for i,row in enumerate(ws.iter_rows(values_only=True),start=1):
-                  rows.append([None if x is None else str(x)[:300] for x in row])
-                  if i>=8:break
-              report['sheets'].append({'title':ws.title,'max_row':ws.max_row,'max_column':ws.max_column,'first_rows':rows})
-          with open('out/JAPAN_WORKBOOK_SCHEMA.json','w',encoding='utf-8') as f:json.dump(report,f,ensure_ascii=False,indent=2)
+          cat > /tmp/japan_audit.py <<'PY'
+          import json,re,pathlib,time
+          import requests
+          from bs4 import BeautifulSoup
+
+          out=pathlib.Path('out')
+          report={
+            'countryID':'jp',
+            'minimumRequired':300,
+            'policy':'Only source-grounded recipes from public-domain or explicit commercial-compatible Creative Commons sources. No relabelling of other cuisines and no synthetic recipe variants.'
+          }
+
+          # 1) Open Recipe Archive: public-domain Japan corpus.
+          ora=pathlib.Path('open-recipe-archive/collections/japanese-kitchen/recipes.jsonl')
+          ora_rows=[]
+          if ora.exists():
+            for line in ora.read_text(encoding='utf-8').splitlines():
+              try:r=json.loads(line)
+              except:continue
+              if str(r.get('culture','')).casefold()=='japan' and str(r.get('license','')).casefold() in {'public-domain','public domain','cc0','unlicense'}:
+                ora_rows.append(r)
+          report['openRecipeArchive']={'usableRows':len(ora_rows),'license':'public-domain','source':'AdamBouhmad/open-recipe-archive japanese-kitchen'}
+          with (out/'source/open-recipe-archive-japan.jsonl').open('w',encoding='utf-8') as f:
+            for r in ora_rows:f.write(json.dumps(r,ensure_ascii=False)+'\n')
+
+          # 2) ForkRecipe: explicit CC BY-SA recipes tagged/categorised Japanese.
+          fr=[]
+          for p in pathlib.Path('forkrecipe-recipes/recipes').glob('*.js'):
+            t=p.read_text(encoding='utf-8',errors='ignore')
+            cuisine=re.search(r'\bcuisine:\s*["\']([^"\']+)["\']',t)
+            culture=re.search(r'\bculture:\s*["\']([^"\']+)["\']',t)
+            lic=re.search(r'\blicense:\s*["\']([^"\']+)["\']',t)
+            is_jp=(cuisine and 'japan' in cuisine.group(1).casefold()) or (culture and 'japan' in culture.group(1).casefold())
+            if is_jp and lic and 'cc-by-sa' in lic.group(1).casefold():
+              fr.append({'path':str(p.relative_to('forkrecipe-recipes')),'cuisine':cuisine.group(1) if cuisine else None,'culture':culture.group(1) if culture else None,'license':lic.group(1)})
+          report['forkRecipe']={'usableRows':len(fr),'license':'CC BY-SA','source':'futurechef/forkrecipe-recipes'}
+          (out/'source/forkrecipe-japan-index.json').write_text(json.dumps(fr,ensure_ascii=False,indent=2),encoding='utf-8')
+
+          # 3) CODH Tamago Hyakuchin. Dataset is CC BY-SA 4.0. We distinguish
+          # pages with modern recipe quantities from pages that only have transcription.
+          s=requests.Session(); s.headers['User-Agent']='REMNIS-One-source-audit/1.0 (+https://proartlabs.com/remnis-one/)'
+          tamago=[]; modern=0; transcription=0
+          for i in range(1,101):
+            url=f'https://codh.rois.ac.jp/edo-cooking/tamago-hyakuchin/recipe/{i:03d}.html.ja'
+            try:
+              rr=s.get(url,timeout=20); rr.raise_for_status()
+            except Exception as e:
+              tamago.append({'id':i,'url':url,'ok':False,'error':str(e)[:160]}); continue
+            soup=BeautifulSoup(rr.text,'html.parser')
+            txt=soup.get_text('\n',strip=True)
+            title=(soup.find('h2') or soup.find('h1'))
+            has_modern='現代レシピ' in txt and '分量' in txt
+            has_trans=('翻刻テキスト' in txt and '手順' in txt)
+            modern += int(has_modern); transcription += int(has_trans)
+            tamago.append({'id':i,'url':url,'ok':True,'title':title.get_text(' ',strip=True) if title else None,'modernRecipe':has_modern,'transcription':has_trans})
+            time.sleep(.05)
+          report['tamagoHyakuchin']={'pages':sum(1 for x in tamago if x['ok']),'modernRecipePages':modern,'transcriptionPages':transcription,'license':'CC BY-SA 4.0','source':'ROIS-DS CODH Edo Cooking Dataset'}
+          (out/'source/tamago-hyakuchin-index.json').write_text(json.dumps(tamago,ensure_ascii=False,indent=2),encoding='utf-8')
+
+          # 4) Wikibooks Japanese recipe category. Wikibooks text is CC BY-SA.
+          api='https://en.wikibooks.org/w/api.php'
+          cm=[]; cont={}
+          while True:
+            params={'action':'query','format':'json','list':'categorymembers','cmtitle':'Category:Japanese recipes','cmlimit':'500','cmnamespace':'102'}
+            params.update(cont)
+            data=s.get(api,params=params,timeout=30).json()
+            cm.extend(data.get('query',{}).get('categorymembers',[]))
+            if 'continue' not in data:break
+            cont=data['continue']
+          report['wikibooks']={'categoryRows':len(cm),'license':'CC BY-SA','source':'Wikibooks Category:Japanese recipes'}
+          (out/'source/wikibooks-japanese-index.json').write_text(json.dumps(cm,ensure_ascii=False,indent=2),encoding='utf-8')
+
+          # Capacity count is deliberately conservative: Tamago pages are counted only
+          # when a modern recipe is present. Transcription-only pages require a separate
+          # source-faithful normalisation pass rather than fabricated quantities.
+          conservative = len(ora_rows)+len(fr)+modern+len(cm)
+          potential = len(ora_rows)+len(fr)+transcription+len(cm)
+          report['conservativeLicensedCapacity']=conservative
+          report['potentialLicensedCapacityAfterHistoricalNormalization']=potential
+          report['status']='PASS_CAPACITY' if conservative>=300 else ('PASS_AFTER_HISTORICAL_NORMALIZATION' if potential>=300 else 'NEEDS_MORE_LICENSED_SOURCES')
+          (out/'JAPAN_SOURCE_CAPACITY_AUDIT.json').write_text(json.dumps(report,ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
           print(json.dumps(report,ensure_ascii=False,indent=2))
           PY
-      - name: Upload Japan diagnostic bundle
+          python /tmp/japan_audit.py
+          (cd out && sha256sum source/* JAPAN_SOURCE_CAPACITY_AUDIT.json > audit/SHA256SUMS.txt)
+
+      - name: Upload Japan capacity audit
         uses: actions/upload-artifact@v4
         with:
-          name: remnis-japan-schema-build119
+          name: remnis-japan-capacity-audit-build121
           path: out/
           retention-days: 7
