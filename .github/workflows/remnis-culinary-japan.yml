@@ -1,0 +1,115 @@
+name: REMNIS Culinary Japan Source Build
+
+on:
+  push:
+    branches: [remnis-culinary-build119]
+    paths: [.github/workflows/remnis-culinary-japan.yml]
+  workflow_dispatch:
+
+jobs:
+  japan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Acquire Japan workbook
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out/source out/normalized
+          curl -L --fail --retry 3 -o out/source/Asia_recipes_processed_ali.xlsx https://raw.githubusercontent.com/LiqiaoHuang/Asia_recipe_data/main/Asia_recipes_processed_ali.xlsx
+          python -m pip install --quiet openpyxl
+      - name: Inspect and normalize Japan rows
+        shell: bash
+        run: |
+          cat > /tmp/japan.py <<'PY'
+          import json,re,pathlib,ast
+          from openpyxl import load_workbook
+          src=pathlib.Path('out/source/Asia_recipes_processed_ali.xlsx')
+          out=pathlib.Path('out/normalized');out.mkdir(parents=True,exist_ok=True)
+          wb=load_workbook(src,read_only=True,data_only=True)
+          def nh(x):return re.sub(r'[^a-z0-9]+','',str(x or '').casefold())
+          def find(headers,*aliases):
+            hs=[nh(x) for x in headers]
+            for a in aliases:
+              aa=nh(a)
+              if aa in hs:return hs.index(aa)
+            for i,h in enumerate(hs):
+              if any(nh(a) in h for a in aliases):return i
+          def items(v):
+            if v is None:return []
+            if isinstance(v,(list,tuple)):return [str(x).strip() for x in v if str(x).strip()]
+            s=str(v).strip()
+            for f in (json.loads,ast.literal_eval):
+              try:
+                x=f(s)
+                if isinstance(x,(list,tuple)):return [str(y).strip() for y in x if str(y).strip()]
+              except:pass
+            return [x.strip(' -•\t') for x in re.split(r'\s*(?:\n|;|\|)\s*',s) if x.strip(' -•\t')]
+          U={'g':'g','gram':'g','grams':'g','kg':'kg','kilogram':'kg','kilograms':'kg','ml':'ml','milliliter':'ml','milliliters':'ml','millilitre':'ml','millilitres':'ml','l':'L','liter':'L','liters':'L','litre':'L','litres':'L','tsp':'tsp','teaspoon':'tsp','teaspoons':'tsp','tbsp':'tbsp','tablespoon':'tbsp','tablespoons':'tbsp','cup':'cup','cups':'cup','oz':'oz','ounce':'oz','ounces':'oz','lb':'lb','pound':'lb','pounds':'lb','piece':'piece','pieces':'piece','pc':'piece','pcs':'piece','slice':'slice','slices':'slice','clove':'clove','cloves':'clove','can':'can','cans':'can'}
+          Q=re.compile(r'(?P<n>\d+(?:\.\d+)?|\d+\s*/\s*\d+|\d+\s*[-–]\s*\d+(?:\.\d+)?)\s*(?P<u>kg|g|grams?|kilograms?|ml|millilit(?:er|re)s?|l|lit(?:er|re)s?|tbsp|tablespoons?|tsp|teaspoons?|cups?|oz|ounces?|lb|pounds?|pieces?|pcs?|pc|slices?|cloves?|cans?)\b',re.I)
+          def num(s):
+            s=s.strip().replace(' ','')
+            if '/' in s and re.fullmatch(r'\d+/\d+',s):
+              a,b=s.split('/');return float(a)/float(b) if float(b) else None
+            m=re.fullmatch(r'(\d+(?:\.\d+)?)[-–](\d+(?:\.\d+)?)',s)
+            if m:return (float(m.group(1))+float(m.group(2)))/2
+            try:return float(s)
+            except:return None
+          def ing(x):
+            m=Q.search(x)
+            if not m:return None
+            a=num(m.group('n'));u=U.get(m.group('u').casefold(),m.group('u').casefold())
+            name=re.sub(r'\s+',' ',(x[:m.start()]+' '+x[m.end():]).strip(' -,:()'))
+            return {'name':name,'amount':a,'unit':u,'note':x} if a and a>0 and name else None
+          def steps(v):
+            xs=items(v)
+            if len(xs)<=1 and v:
+              s=str(v).strip(); z=[x.strip() for x in re.split(r'(?:^|\s)\d+[.)]\s*',s) if x.strip()]
+              xs=z if len(z)>=2 else [x.strip() for x in re.split(r'(?<=[.!?])\s+',s) if x.strip()]
+            return [re.sub(r'^\d+[.)]\s*','',x).strip() for x in xs if len(x.strip())>=8]
+          def intish(v):
+            m=re.search(r'\d+(?:\.\d+)?',str(v or ''));return int(round(float(m.group()))) if m else 0
+          best=None
+          for ws in wb.worksheets:
+            it=ws.iter_rows(values_only=True);headers=[str(x or '').strip() for x in next(it,())]
+            inds=(find(headers,'country','country/region','countryregion'),find(headers,'recipename','recipe name','dish name','name'),find(headers,'ingredients','ingredient text','ingredient'),find(headers,'instructions','directions','steps','method'))
+            if None not in inds:best=(ws,headers,*inds);break
+          if not best:raise SystemExit('unsupported workbook schema')
+          ws,h,ci,ni,ii,di=best
+          pi=find(h,'preparationtime','prep time','preptime');ki=find(h,'cookingtime','cook time','cooktime');si=find(h,'servings','serving_new','serving')
+          rows=[];rej={};scanned=0
+          it=ws.iter_rows(values_only=True);next(it,None)
+          for rn,row in enumerate(it,start=2):
+            v=list(row);get=lambda i:v[i] if i is not None and i<len(v) else None
+            country=str(get(ci) or '').strip().casefold()
+            if country not in {'japan','jp','japanese'}:continue
+            scanned+=1;title=str(get(ni) or '').strip()
+            if not title:rej['title']=rej.get('title',0)+1;continue
+            ings=[q for x in items(get(ii)) if (q:=ing(x))]
+            st=steps(get(di))
+            if len(ings)<4:rej['quantities']=rej.get('quantities',0)+1;continue
+            if len(st)<2:rej['steps']=rej.get('steps',0)+1;continue
+            servings=max(1,intish(get(si)) or 4);prep=intish(get(pi));cook=intish(get(ki))
+            estimated=[]
+            if prep<=0 and cook<=0:
+              prep=min(30,max(8,len(st)*3));cook=min(120,max(10,len(st)*4));estimated.append('time-estimated')
+            rows.append({'countryID':'jp','title':title,'description':'Modern Japanese recipe from the CC BY 4.0 Pan-Asian recipe dataset.','ingredients':ings,'steps':st,'mealType':'main','servings':servings,'prepMinutes':prep,'cookMinutes':cook,'tags':['japan','modern','pan-asian-dataset','source-grounded']+estimated,'sourceTitle':'Sustainable diet: Dish-Level Carbon and Nutrition Database for 4,403 Asian Cuisine','sourceURL':'https://doi.org/10.6084/m9.figshare.25999843.v3','sourceYear':2025,'author':'Liqiao Huang et al. / Yin Long et al.','license':'cc-by-4.0','attribution':'Long et al.; dataset distributed under CC BY 4.0'})
+          ded=[];seen=set()
+          for r in rows:
+            k=re.sub(r'\s+',' ',r['title'].casefold()).strip()
+            if k in seen:continue
+            seen.add(k);ded.append(r)
+          with (out/'japan-modern-candidates.jsonl').open('w',encoding='utf-8') as f:
+            for r in ded:f.write(json.dumps(r,ensure_ascii=False)+'\n')
+          report={'sheet':ws.title,'headers':h,'japanRowsScanned':scanned,'productionCandidates':len(ded),'rejected':rej,'minimumRequired':300,'status':'PASS_SOURCE_CAPACITY' if len(ded)>=300 else 'NEEDS_SUPPLEMENT','license':'CC BY 4.0'}
+          pathlib.Path('out/JAPAN_SOURCE_AUDIT.json').write_text(json.dumps(report,ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
+          print(json.dumps(report,ensure_ascii=False,indent=2))
+          PY
+          python /tmp/japan.py
+          (cd out && sha256sum source/* normalized/* JAPAN_SOURCE_AUDIT.json > SHA256SUMS.txt)
+      - name: Upload Japan source bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: remnis-japan-source-build119
+          path: out/
+          retention-days: 7
